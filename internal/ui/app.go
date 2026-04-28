@@ -5,6 +5,7 @@ import (
 	"image/color"
 	"log"
 	"math"
+	"sort"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
@@ -36,21 +37,31 @@ type App struct {
 
 	watcher *watch.Watcher
 
-	panning  bool
-	lastPanX int
-	lastPanY int
+	middlePanning bool
+	lastMidPanX   int
+	lastMidPanY   int
 
-	middlePanning  bool
-	lastMidPanX    int
-	lastMidPanY    int
+	// Left-drag on empty canvas opens a rubber-band selection box. Until the
+	// cursor moves past selectMoveThreshold, the press is treated as a plain
+	// click that preserves the existing selection.
+	maybeSelecting bool
+	selecting      bool
+	selectStartWX  float64
+	selectStartWY  float64
+	selectStartMX  int
+	selectStartMY  int
+	selectCurMX    int
+	selectCurMY    int
 
-	dragging        bool
-	draggedTable    string
-	dragStartCursor [2]float64
-	dragStartTable  [2]float64
+	dragging                bool
+	draggedTable            string
+	dragStartCursor         [2]float64
+	dragStartTablePositions map[string][2]float64
+	dragStartAnnoPositions  map[string][2]float64
 
-	hoveredTable  string
-	selectedTable string
+	hoveredTable   string
+	hoveredGroup   string
+	selectedTables map[string]bool
 
 	dirty bool
 
@@ -60,7 +71,7 @@ type App struct {
 	palette         *widgets.Palette
 	paletteCallback func(c color.NRGBA, clear bool)
 
-	selectedAnno     string
+	selectedAnnos    map[string]bool
 	draggingAnno     string
 	draggingAnnoMode int
 	dragStartAnno    [4]float64
@@ -72,6 +83,12 @@ type App struct {
 
 	renamingView string
 	renameBuffer string
+
+	renamingGroup     string
+	renameGroupBuffer string
+
+	lastClickedGroupID    string
+	lastClickedGroupFrame int
 
 	cellEdit cellEdit
 
@@ -114,7 +131,235 @@ type tableHit struct {
 	Region tableRegion
 }
 
-const doubleClickFrames = 24 // ~400ms at 60fps
+const (
+	doubleClickFrames    = 24 // ~400ms at 60fps
+	selectMoveThreshold  = 5  // pixels of movement before a press becomes a drag
+)
+
+func (a *App) selectOnlyTable(name string) {
+	a.selectedTables = map[string]bool{name: true}
+	a.selectedAnnos = nil
+}
+
+func (a *App) selectOnlyAnno(id string) {
+	a.selectedAnnos = map[string]bool{id: true}
+	a.selectedTables = nil
+}
+
+func (a *App) isTableSelected(name string) bool { return a.selectedTables[name] }
+func (a *App) isAnnoSelected(id string) bool    { return a.selectedAnnos[id] }
+
+// isTableHovered reports whether the cursor is "softly" over a given table —
+// either directly hovering the table card, or hovering a group whose members
+// include this table. Group-hover acts as a soft-selection so users can
+// preview a group's connections at a glance.
+func (a *App) isTableHovered(name string) bool {
+	if a.hoveredTable == name {
+		return true
+	}
+	if a.hoveredGroup == "" {
+		return false
+	}
+	for _, g := range a.currentView().Groups {
+		if g.ID != a.hoveredGroup {
+			continue
+		}
+		for _, m := range g.Tables {
+			if m == name {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func (a *App) selectedTablesList() []string {
+	out := make([]string, 0, len(a.selectedTables))
+	for n := range a.selectedTables {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (a *App) selectedAnnosList() []string {
+	out := make([]string, 0, len(a.selectedAnnos))
+	for id := range a.selectedAnnos {
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (a *App) selectionSize() int { return len(a.selectedTables) + len(a.selectedAnnos) }
+
+// applySelectionColor paints every currently selected table and annotation
+// with hex (or clears the colour when clear is true).
+func (a *App) applySelectionColor(hex string, clear bool) {
+	for _, name := range a.selectedTablesList() {
+		if clear {
+			a.setTableColor(name, "")
+		} else {
+			a.setTableColor(name, hex)
+		}
+	}
+	for _, id := range a.selectedAnnosList() {
+		if clear {
+			a.setAnnotationColor(id, "")
+		} else {
+			a.setAnnotationColor(id, hex)
+		}
+	}
+}
+
+// removeSelectedTables tries to delete every selected table. Each removal is
+// independent and may abort with a logged error if it has inline-ref
+// dependents that aren't also being removed.
+func (a *App) removeSelectedTables() {
+	for _, name := range a.selectedTablesList() {
+		a.removeTable(name)
+	}
+}
+
+func (a *App) removeSelectedAnnotations() {
+	for _, id := range a.selectedAnnosList() {
+		a.deleteAnnotation(id)
+	}
+}
+
+func (a *App) newGroupFromSelection() {
+	view := a.currentView()
+	members := a.selectedTablesList()
+	if len(members) == 0 {
+		return
+	}
+	view.Groups = append(view.Groups, &meta.Group{
+		ID:     meta.NewID(),
+		Name:   nextGroupName(view.Groups),
+		Tables: members,
+	})
+	a.dirty = true
+	if err := a.persist(); err != nil {
+		log.Printf("persist: %v", err)
+	}
+}
+
+func (a *App) addSelectionToGroup(groupID string) {
+	view := a.currentView()
+	for _, g := range view.Groups {
+		if g.ID != groupID {
+			continue
+		}
+		existing := map[string]bool{}
+		for _, m := range g.Tables {
+			existing[m] = true
+		}
+		for _, n := range a.selectedTablesList() {
+			if !existing[n] {
+				g.Tables = append(g.Tables, n)
+				existing[n] = true
+			}
+		}
+		a.dirty = true
+		if err := a.persist(); err != nil {
+			log.Printf("persist: %v", err)
+		}
+		return
+	}
+}
+
+func (a *App) removeSelectionFromGroup(groupID string) {
+	view := a.currentView()
+	sel := a.selectedTables
+	for _, g := range view.Groups {
+		if g.ID != groupID {
+			continue
+		}
+		out := g.Tables[:0]
+		for _, m := range g.Tables {
+			if !sel[m] {
+				out = append(out, m)
+			}
+		}
+		g.Tables = out
+		a.dirty = true
+		if err := a.persist(); err != nil {
+			log.Printf("persist: %v", err)
+		}
+		return
+	}
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// applyBoxSelection finalises a rubber-band selection: every table whose AABB
+// intersects the box becomes selected; every annotation whose AABB intersects
+// becomes selected. The box is the axis-aligned rect spanned by the screen
+// positions where the press started and ended.
+func (a *App) applyBoxSelection() {
+	x0, y0 := a.camera.ScreenToWorld(float64(a.selectStartMX), float64(a.selectStartMY))
+	x1, y1 := a.camera.ScreenToWorld(float64(a.selectCurMX), float64(a.selectCurMY))
+	if x1 < x0 {
+		x0, x1 = x1, x0
+	}
+	if y1 < y0 {
+		y0, y1 = y1, y0
+	}
+
+	view := a.currentView()
+	tables := map[string]bool{}
+	for i := range a.schema.Tables {
+		t := &a.schema.Tables[i]
+		p, ok := view.Tables[t.Name]
+		if !ok || p.Hidden || p.Orphaned {
+			continue
+		}
+		box := render.MeasureTable(t)
+		if rectsIntersect(p.X, p.Y, p.X+box.W, p.Y+box.H, x0, y0, x1, y1) {
+			tables[t.Name] = true
+		}
+	}
+	annos := map[string]bool{}
+	for _, an := range view.Annotations {
+		if rectsIntersect(an.X, an.Y, an.X+an.W, an.Y+an.H, x0, y0, x1, y1) {
+			annos[an.ID] = true
+		}
+	}
+	a.selectedTables = tables
+	a.selectedAnnos = annos
+}
+
+func rectsIntersect(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1 float64) bool {
+	return ax1 >= bx0 && ax0 <= bx1 && ay1 >= by0 && ay0 <= by1
+}
+
+func (a *App) drawSelectionBox(screen *ebiten.Image) {
+	if !a.selecting {
+		return
+	}
+	x0 := float64(a.selectStartMX)
+	y0 := float64(a.selectStartMY)
+	x1 := float64(a.selectCurMX)
+	y1 := float64(a.selectCurMY)
+	if x1 < x0 {
+		x0, x1 = x1, x0
+	}
+	if y1 < y0 {
+		y0, y1 = y1, y0
+	}
+	fill := theme.ColorAccent
+	fill.A = 0x18
+	vector.FillRect(screen, float32(x0), float32(y0), float32(x1-x0), float32(y1-y0), fill, false)
+	border := theme.ColorAccent
+	border.A = 0xc0
+	vector.StrokeRect(screen, float32(x0), float32(y0), float32(x1-x0), float32(y1-y0), 1, border, false)
+}
 
 const (
 	annoModeMove   = 0
@@ -216,6 +461,12 @@ func (a *App) Update() error {
 		return nil
 	}
 
+	if a.renamingGroup != "" {
+		a.updateGroupRenameEditing()
+		a.tickCaret()
+		return nil
+	}
+
 	if a.editingAnno != "" {
 		a.updateTextEditing()
 		a.tickCaret()
@@ -302,6 +553,10 @@ func (a *App) Update() error {
 			a.menu = a.buildTableMenu(hit, mx, my)
 			return nil
 		}
+		if gid := a.groupLabelAtWorld(wx, wy); gid != "" {
+			a.menu = a.buildGroupMenu(gid, mx, my)
+			return nil
+		}
 		if key := a.relationshipAtScreen(mx, my); key != "" {
 			a.menu = a.buildRelationshipMenu(key, mx, my)
 			return nil
@@ -312,22 +567,22 @@ func (a *App) Update() error {
 
 	if inpressed := ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft); inpressed {
 		switch {
-		case a.draggingAnno != "":
+		case a.draggingAnno != "" && a.draggingAnnoMode == annoModeResize:
 			a.updateAnnotationDrag(wx, wy)
-		case a.dragging:
-			ndx := wx - a.dragStartCursor[0]
-			ndy := wy - a.dragStartCursor[1]
-			view := a.currentView()
-			if p := view.Tables[a.draggedTable]; p != nil {
-				p.X = a.dragStartTable[0] + ndx
-				p.Y = a.dragStartTable[1] + ndy
-				a.dirty = true
+		case a.dragging || a.draggingAnno != "":
+			a.updateGroupDrag(wx, wy)
+		case a.maybeSelecting:
+			dxm := mx - a.selectStartMX
+			dym := my - a.selectStartMY
+			if abs(dxm) >= selectMoveThreshold || abs(dym) >= selectMoveThreshold {
+				a.maybeSelecting = false
+				a.selecting = true
+				a.selectCurMX = mx
+				a.selectCurMY = my
 			}
-		case a.panning:
-			dx := float64(mx - a.lastPanX)
-			dy := float64(my - a.lastPanY)
-			a.camera.Pan(dx, dy)
-			a.lastPanX, a.lastPanY = mx, my
+		case a.selecting:
+			a.selectCurMX = mx
+			a.selectCurMY = my
 		default:
 			// Double-click on table text → in-place edit.
 			hit := a.hitTestTable(wx, wy)
@@ -349,23 +604,58 @@ func (a *App) Update() error {
 			}
 			a.recordClick(hit)
 
+			// Click on a group label: double-click → rename, single click →
+			// select every table that's a member of the group (so the user
+			// can drag, colour, group-op them as one unit).
+			if hit.Region == regionNone {
+				if gid := a.groupLabelAtWorld(wx, wy); gid != "" {
+					if a.lastClickedGroupID == gid && a.frameCount-a.lastClickedGroupFrame < doubleClickFrames {
+						a.startRenamingGroup(gid)
+						a.lastClickedGroupID = ""
+						a.lastClickedGroupFrame = 0
+						return nil
+					}
+					a.lastClickedGroupID = gid
+					a.lastClickedGroupFrame = a.frameCount
+					a.selectGroupMembers(gid)
+					// Set up for group drag from this position so the user can
+					// drag the whole group by holding the label.
+					a.dragging = true
+					a.draggedTable = ""
+					a.dragStartCursor = [2]float64{wx, wy}
+					a.captureGroupDragStart()
+					return nil
+				}
+			}
+
 			if id, mode := a.annotationAt(wx, wy); id != "" {
-				a.startAnnotationDrag(id, mode, wx, wy)
-				a.selectedAnno = id
-				a.selectedTable = ""
+				if mode == annoModeResize {
+					a.selectOnlyAnno(id)
+					a.startAnnotationDrag(id, mode, wx, wy)
+				} else {
+					if !a.isAnnoSelected(id) {
+						a.selectOnlyAnno(id)
+					}
+					a.draggingAnno = id
+					a.draggingAnnoMode = annoModeMove
+					a.dragStartCursor = [2]float64{wx, wy}
+					a.captureGroupDragStart()
+				}
 			} else if name := a.tableAtWorld(wx, wy); name != "" {
+				if !a.isTableSelected(name) {
+					a.selectOnlyTable(name)
+				}
 				a.dragging = true
 				a.draggedTable = name
 				a.dragStartCursor = [2]float64{wx, wy}
-				p := a.currentView().Tables[name]
-				a.dragStartTable = [2]float64{p.X, p.Y}
-				a.selectedAnno = ""
-				a.selectedTable = name
+				a.captureGroupDragStart()
 			} else {
-				a.panning = true
-				a.lastPanX, a.lastPanY = mx, my
-				// Do NOT clear selection here — panning the canvas should
-				// preserve whatever table/annotation the user was inspecting.
+				// Left-down on empty canvas — defer the decision to either
+				// "selection box" (if drag) or "no-op" (if just a click).
+				a.maybeSelecting = true
+				a.selectStartWX, a.selectStartWY = wx, wy
+				a.selectStartMX, a.selectStartMY = mx, my
+				a.selectCurMX, a.selectCurMY = mx, my
 			}
 		}
 	} else {
@@ -374,10 +664,20 @@ func (a *App) Update() error {
 				log.Printf("persist: %v", err)
 			}
 		}
+		if a.selecting {
+			a.applyBoxSelection()
+			a.selecting = false
+		} else if a.maybeSelecting {
+			// Click on empty canvas without dragging → clear selection.
+			a.selectedTables = nil
+			a.selectedAnnos = nil
+		}
 		a.dragging = false
 		a.draggedTable = ""
-		a.panning = false
 		a.draggingAnno = ""
+		a.dragStartTablePositions = nil
+		a.dragStartAnnoPositions = nil
+		a.maybeSelecting = false
 	}
 
 	_, scrollY := ebiten.Wheel()
@@ -392,8 +692,14 @@ func (a *App) Update() error {
 
 	if a.menu == nil && a.palette == nil && my >= tabBarHeight {
 		a.hoveredTable = a.tableAtWorld(wx, wy)
+		if a.hoveredTable == "" {
+			a.hoveredGroup = a.groupLabelAtWorld(wx, wy)
+		} else {
+			a.hoveredGroup = ""
+		}
 	} else {
 		a.hoveredTable = ""
+		a.hoveredGroup = ""
 	}
 
 	return nil
@@ -571,6 +877,8 @@ func (a *App) Draw(screen *ebiten.Image) {
 	a.drawTables(screen)
 	a.drawAnnotations(screen)
 	a.drawCellEditOverlay(screen)
+	a.drawGroupRenameOverlay(screen)
+	a.drawSelectionBox(screen)
 	a.drawTabBar(screen)
 	if a.menu != nil {
 		a.menu.Draw(screen)
@@ -901,8 +1209,12 @@ func (a *App) commitCellEdit() {
 	// If the active selected/dragged table got renamed, follow the rename so
 	// hover state stays meaningful.
 	if e.Kind == cellEditTableName {
-		if a.selectedTable == e.Table {
-			a.selectedTable = e.Buffer
+		if a.isTableSelected(e.Table) {
+			delete(a.selectedTables, e.Table)
+			if a.selectedTables == nil {
+				a.selectedTables = map[string]bool{}
+			}
+			a.selectedTables[e.Buffer] = true
 		}
 		if a.hoveredTable == e.Table {
 			a.hoveredTable = e.Buffer
@@ -1078,6 +1390,230 @@ func (a *App) cancelRenamingView() {
 	a.renameBuffer = ""
 }
 
+func (a *App) groupLabelAtWorld(wx, wy float64) string {
+	view := a.currentView()
+	tableIdx := make(map[string]*dbml.Table, len(a.schema.Tables))
+	for i := range a.schema.Tables {
+		tableIdx[a.schema.Tables[i].Name] = &a.schema.Tables[i]
+	}
+	for _, g := range view.Groups {
+		minX, minY := math.Inf(1), math.Inf(1)
+		maxX, maxY := math.Inf(-1), math.Inf(-1)
+		any := false
+		for _, name := range g.Tables {
+			p, ok := view.Tables[name]
+			if !ok || p.Hidden {
+				continue
+			}
+			t, ok := tableIdx[name]
+			if !ok {
+				continue
+			}
+			box := render.MeasureTable(t)
+			if p.X < minX {
+				minX = p.X
+			}
+			if p.Y < minY {
+				minY = p.Y
+			}
+			if p.X+box.W > maxX {
+				maxX = p.X + box.W
+			}
+			if p.Y+box.H > maxY {
+				maxY = p.Y + box.H
+			}
+			any = true
+		}
+		if !any {
+			continue
+		}
+		pad := render.GroupPadding
+		header := render.GroupHeaderH
+		// Hit area = the whole visible group rect (label header band + pad +
+		// tables area + pad). Tables are checked earlier in the click path so
+		// hitting a table inside the rect still goes to the table, not here.
+		rectMinX := minX - pad
+		rectMaxX := maxX + pad
+		rectMinY := minY - pad - header
+		rectMaxY := maxY + pad
+		if wx >= rectMinX && wx <= rectMaxX && wy >= rectMinY && wy <= rectMaxY {
+			return g.ID
+		}
+	}
+	return ""
+}
+
+func (a *App) startRenamingGroup(groupID string) {
+	for _, g := range a.currentView().Groups {
+		if g.ID == groupID {
+			a.renamingGroup = groupID
+			a.renameGroupBuffer = g.Name
+			a.caretBlinkOn = true
+			a.caretFrame = 0
+			return
+		}
+	}
+}
+
+func (a *App) commitRenamingGroup() {
+	for _, g := range a.currentView().Groups {
+		if g.ID == a.renamingGroup {
+			if a.renameGroupBuffer != "" {
+				g.Name = a.renameGroupBuffer
+			}
+			a.dirty = true
+			if err := a.persist(); err != nil {
+				log.Printf("persist: %v", err)
+			}
+			break
+		}
+	}
+	a.renamingGroup = ""
+	a.renameGroupBuffer = ""
+}
+
+func (a *App) cancelRenamingGroup() {
+	a.renamingGroup = ""
+	a.renameGroupBuffer = ""
+}
+
+func (a *App) updateGroupRenameEditing() {
+	chars := ebiten.AppendInputChars(nil)
+	if len(chars) > 0 {
+		a.renameGroupBuffer += string(chars)
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyBackspace) || keyRepeatPressed(ebiten.KeyBackspace) {
+		if len(a.renameGroupBuffer) > 0 {
+			r := []rune(a.renameGroupBuffer)
+			a.renameGroupBuffer = string(r[:len(r)-1])
+		}
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyKPEnter) {
+		a.commitRenamingGroup()
+		return
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+		a.cancelRenamingGroup()
+		return
+	}
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) || inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonRight) {
+		a.commitRenamingGroup()
+	}
+}
+
+// selectGroupMembers sets the current table selection to every member of the
+// given group whose name is in the schema. Annotation selection is cleared.
+func (a *App) selectGroupMembers(gid string) {
+	for _, g := range a.currentView().Groups {
+		if g.ID != gid {
+			continue
+		}
+		sel := map[string]bool{}
+		for _, m := range g.Tables {
+			sel[m] = true
+		}
+		a.selectedTables = sel
+		a.selectedAnnos = nil
+		return
+	}
+}
+
+func (a *App) drawGroupRenameOverlay(screen *ebiten.Image) {
+	if a.renamingGroup == "" {
+		return
+	}
+	view := a.currentView()
+	var g *meta.Group
+	for _, gg := range view.Groups {
+		if gg.ID == a.renamingGroup {
+			g = gg
+			break
+		}
+	}
+	if g == nil {
+		return
+	}
+
+	tableIdx := make(map[string]*dbml.Table, len(a.schema.Tables))
+	for i := range a.schema.Tables {
+		tableIdx[a.schema.Tables[i].Name] = &a.schema.Tables[i]
+	}
+	minX, minY := math.Inf(1), math.Inf(1)
+	any := false
+	for _, name := range g.Tables {
+		p, ok := view.Tables[name]
+		if !ok || p.Hidden {
+			continue
+		}
+		t, ok := tableIdx[name]
+		if !ok {
+			continue
+		}
+		box := render.MeasureTable(t)
+		_ = box
+		if p.X < minX {
+			minX = p.X
+		}
+		if p.Y < minY {
+			minY = p.Y
+		}
+		any = true
+	}
+	if !any {
+		return
+	}
+
+	pad := render.GroupPadding
+	header := render.GroupHeaderH
+	labelLeftWorld := minX - pad
+	labelTopWorld := minY - pad - header
+
+	sxLeft, sy := a.camera.WorldToScreen(labelLeftWorld+8, labelTopWorld+4)
+	scale := a.camera.Zoom
+
+	display := a.renameGroupBuffer
+	if a.caretBlinkOn {
+		display += "_"
+	}
+	tw := render.TextWidth(display)
+	if tw < render.TextWidth("xxxxxx") {
+		tw = render.TextWidth("xxxxxx")
+	}
+
+	padPx := 4 * scale
+	boxW := tw*scale + padPx*2
+	boxH := 16 * scale
+	boxX := sxLeft - padPx
+	boxY := sy - 2*scale
+
+	vector.FillRect(screen, float32(boxX), float32(boxY), float32(boxW), float32(boxH), theme.ColorSurface, false)
+	vector.StrokeRect(screen, float32(boxX), float32(boxY), float32(boxW), float32(boxH), 1, theme.ColorAccent, false)
+	render.DrawText(screen, display, sxLeft, sy, scale, theme.ColorText)
+}
+
+func (a *App) buildGroupMenu(groupID string, mx, my int) *widgets.Menu {
+	return &widgets.Menu{
+		X: float64(mx), Y: float64(my),
+		Items: []widgets.MenuItem{
+			{Label: "Rename group", Action: func() { a.startRenamingGroup(groupID) }},
+			{
+				Label: "Set group colour…",
+				Action: func() {
+					a.openPalette(mx, my, func(c color.NRGBA, clear bool) {
+						if clear {
+							a.setGroupColor(groupID, "")
+						} else {
+							a.setGroupColor(groupID, toHex(c))
+						}
+					})
+				},
+			},
+			{Sep: true},
+			{Label: "Delete group", Action: func() { a.deleteGroup(groupID) }},
+		},
+	}
+}
+
 func (a *App) updateRenameEditing() {
 	chars := ebiten.AppendInputChars(nil)
 	if len(chars) > 0 {
@@ -1245,7 +1781,7 @@ func (a *App) drawAnnotations(screen *ebiten.Image) {
 		if editing {
 			text = a.editBuffer
 		}
-		render.DrawAnnotation(screen, sx, sy, sw, sh, a.camera.Zoom, text, clr, a.selectedAnno == an.ID, editing, caret)
+		render.DrawAnnotation(screen, sx, sy, sw, sh, a.camera.Zoom, text, clr, a.isAnnoSelected(an.ID), editing, caret)
 	}
 }
 
@@ -1273,6 +1809,51 @@ func (a *App) annotationAt(wx, wy float64) (string, int) {
 		return an.ID, annoModeMove
 	}
 	return "", 0
+}
+
+// captureGroupDragStart records the starting position of every currently
+// selected table and annotation so a group drag can apply a uniform delta.
+func (a *App) captureGroupDragStart() {
+	view := a.currentView()
+	a.dragStartTablePositions = map[string][2]float64{}
+	for name := range a.selectedTables {
+		if p, ok := view.Tables[name]; ok {
+			a.dragStartTablePositions[name] = [2]float64{p.X, p.Y}
+		}
+	}
+	a.dragStartAnnoPositions = map[string][2]float64{}
+	for id := range a.selectedAnnos {
+		for _, an := range view.Annotations {
+			if an.ID == id {
+				a.dragStartAnnoPositions[id] = [2]float64{an.X, an.Y}
+				break
+			}
+		}
+	}
+}
+
+// updateGroupDrag moves every selected table and annotation by the cursor
+// delta from the drag start. Resizing is handled separately.
+func (a *App) updateGroupDrag(wx, wy float64) {
+	dx := wx - a.dragStartCursor[0]
+	dy := wy - a.dragStartCursor[1]
+	view := a.currentView()
+	for name, start := range a.dragStartTablePositions {
+		if p, ok := view.Tables[name]; ok {
+			p.X = start[0] + dx
+			p.Y = start[1] + dy
+		}
+	}
+	for id, start := range a.dragStartAnnoPositions {
+		for _, an := range view.Annotations {
+			if an.ID == id {
+				an.X = start[0] + dx
+				an.Y = start[1] + dy
+				break
+			}
+		}
+	}
+	a.dirty = true
 }
 
 func (a *App) startAnnotationDrag(id string, mode int, wx, wy float64) {
@@ -1350,7 +1931,7 @@ func (a *App) addTable(wx, wy float64) {
 	if err := a.persist(); err != nil {
 		log.Printf("persist: %v", err)
 	}
-	a.selectedTable = name
+	a.selectOnlyTable(name)
 	a.startCellEdit(cellEditTableName, name, "")
 }
 
@@ -1397,9 +1978,7 @@ func (a *App) removeTable(table string) {
 	if res != nil && res.Schema != nil {
 		a.schema = res.Schema
 	}
-	if a.selectedTable == table {
-		a.selectedTable = ""
-	}
+	delete(a.selectedTables, table)
 	if a.hoveredTable == table {
 		a.hoveredTable = ""
 	}
@@ -1441,24 +2020,45 @@ func nextNewColumnName(t *dbml.Table) string {
 }
 
 func (a *App) buildAnnotationMenu(id string, mx, my int) *widgets.Menu {
+	multi := a.isAnnoSelected(id) && a.selectionSize() > 1
+
+	colourLabel := "Set colour…"
+	deleteLabel := "Delete annotation"
+	if multi {
+		colourLabel = fmt.Sprintf("Set colour for %d items…", a.selectionSize())
+		deleteLabel = fmt.Sprintf("Delete %d annotations", len(a.selectedAnnos))
+	}
+
 	return &widgets.Menu{
 		X: float64(mx), Y: float64(my),
 		Items: []widgets.MenuItem{
 			{Label: "Edit text", Action: func() { a.startEditing(id) }},
 			{
-				Label: "Set colour…",
+				Label: colourLabel,
 				Action: func() {
 					a.openPalette(mx, my, func(c color.NRGBA, clear bool) {
-						if clear {
+						switch {
+						case multi:
+							a.applySelectionColor(toHex(c), clear)
+						case clear:
 							a.setAnnotationColor(id, "")
-						} else {
+						default:
 							a.setAnnotationColor(id, toHex(c))
 						}
 					})
 				},
 			},
 			{Sep: true},
-			{Label: "Delete annotation", Action: func() { a.deleteAnnotation(id) }},
+			{
+				Label: deleteLabel,
+				Action: func() {
+					if multi {
+						a.removeSelectedAnnotations()
+					} else {
+						a.deleteAnnotation(id)
+					}
+				},
+			},
 		},
 	}
 }
@@ -1490,9 +2090,7 @@ func (a *App) deleteAnnotation(id string) {
 		}
 	}
 	view.Annotations = out
-	if a.selectedAnno == id {
-		a.selectedAnno = ""
-	}
+	delete(a.selectedAnnos, id)
 	if a.editingAnno == id {
 		a.editingAnno = ""
 	}
@@ -1581,6 +2179,19 @@ func (a *App) buildTableMenu(hit tableHit, mx, my int) *widgets.Menu {
 		}
 	}
 
+	multi := a.isTableSelected(table) && a.selectionSize() > 1
+	selCount := a.selectionSize()
+	tablesInSel := len(a.selectedTables)
+
+	colourLabel := "Set table colour…"
+	removeLabel := "Remove table " + table
+	newGroupLabel := "New group with this table"
+	if multi {
+		colourLabel = fmt.Sprintf("Set colour for %d items…", selCount)
+		removeLabel = fmt.Sprintf("Remove %d tables", tablesInSel)
+		newGroupLabel = fmt.Sprintf("New group with %d tables", tablesInSel)
+	}
+
 	var items []widgets.MenuItem
 	items = append(items, widgets.MenuItem{
 		Label:  "Add field",
@@ -1595,25 +2206,40 @@ func (a *App) buildTableMenu(hit tableHit, mx, my int) *widgets.Menu {
 	}
 	items = append(items, widgets.MenuItem{Sep: true})
 	items = append(items, widgets.MenuItem{
-		Label: "Set table colour…",
+		Label: colourLabel,
 		Action: func() {
 			a.openPalette(mx, my, func(c color.NRGBA, clear bool) {
-				if clear {
+				switch {
+				case multi:
+					a.applySelectionColor(toHex(c), clear)
+				case clear:
 					a.setTableColor(table, "")
-				} else {
+				default:
 					a.setTableColor(table, toHex(c))
 				}
 			})
 		},
 	})
 	items = append(items, widgets.MenuItem{
-		Label:  "Remove table " + table,
-		Action: func() { a.removeTable(table) },
+		Label: removeLabel,
+		Action: func() {
+			if multi {
+				a.removeSelectedTables()
+			} else {
+				a.removeTable(table)
+			}
+		},
 	})
 	items = append(items, widgets.MenuItem{Sep: true})
 	items = append(items, widgets.MenuItem{
-		Label:  "New group with this table",
-		Action: func() { a.newGroupWith(table) },
+		Label: newGroupLabel,
+		Action: func() {
+			if multi {
+				a.newGroupFromSelection()
+			} else {
+				a.newGroupWith(table)
+			}
+		},
 	})
 
 	if len(view.Groups) > 0 {
@@ -1621,7 +2247,35 @@ func (a *App) buildTableMenu(hit tableHit, mx, my int) *widgets.Menu {
 		for _, g := range view.Groups {
 			gID := g.ID
 			gName := g.Name
-			if memberOf[g.ID] {
+			memberSet := map[string]bool{}
+			for _, m := range g.Tables {
+				memberSet[m] = true
+			}
+			if multi {
+				// Count how many of the selected tables are/aren't already in this group.
+				addable, removable := 0, 0
+				for n := range a.selectedTables {
+					if memberSet[n] {
+						removable++
+					} else {
+						addable++
+					}
+				}
+				if addable > 0 {
+					items = append(items, widgets.MenuItem{
+						Label:  fmt.Sprintf("Add %d selected to %s", addable, gName),
+						Action: func() { a.addSelectionToGroup(gID) },
+					})
+				}
+				if removable > 0 {
+					items = append(items, widgets.MenuItem{
+						Label:  fmt.Sprintf("Remove %d selected from %s", removable, gName),
+						Action: func() { a.removeSelectionFromGroup(gID) },
+					})
+				}
+				continue
+			}
+			if memberSet[table] {
 				items = append(items, widgets.MenuItem{
 					Label:  "Remove from " + gName,
 					Action: func() { a.removeFromGroup(table, gID) },
@@ -1810,8 +2464,24 @@ func (a *App) drawGroups(screen *ebiten.Image) {
 		ex, ey := a.camera.WorldToScreen(maxX, maxY)
 
 		clr := groupColor(g, i)
-		render.DrawGroup(screen, sx, sy, ex-sx, ey-sy, g.Name, clr, a.camera.Zoom)
+		active := g.ID == a.hoveredGroup || g.ID == a.renamingGroup || a.groupHasSelectedMembers(g)
+		render.DrawGroup(screen, sx, sy, ex-sx, ey-sy, g.Name, clr, a.camera.Zoom, active)
 	}
+}
+
+// groupHasSelectedMembers returns true if at least one of the group's members
+// is in the current table selection. Used to light up groups whose contents
+// are part of an active selection.
+func (a *App) groupHasSelectedMembers(g *meta.Group) bool {
+	if len(a.selectedTables) == 0 {
+		return false
+	}
+	for _, m := range g.Tables {
+		if a.selectedTables[m] {
+			return true
+		}
+	}
+	return false
 }
 
 func groupColor(g *meta.Group, idx int) color.NRGBA {
@@ -1896,19 +2566,19 @@ func (a *App) drawTables(screen *ebiten.Image) {
 			accent = c
 		}
 		highlighted := t.Name == a.draggedTable ||
-			t.Name == a.selectedTable ||
-			t.Name == a.hoveredTable
+			a.isTableSelected(t.Name) ||
+			a.isTableHovered(t.Name)
 		render.DrawTable(screen, t, sx, sy, a.camera.Zoom, accent, highlighted)
 	}
 }
 
 // relationshipShouldPulse returns true when the relationship is connected to
-// the currently hovered or selected table.
+// any hovered (incl. via group hover) or selected table.
 func (a *App) relationshipShouldPulse(r dbml.Relationship) bool {
-	if a.hoveredTable != "" && (r.FromTable == a.hoveredTable || r.ToTable == a.hoveredTable) {
+	if a.isTableHovered(r.FromTable) || a.isTableHovered(r.ToTable) {
 		return true
 	}
-	if a.selectedTable != "" && (r.FromTable == a.selectedTable || r.ToTable == a.selectedTable) {
+	if a.isTableSelected(r.FromTable) || a.isTableSelected(r.ToTable) {
 		return true
 	}
 	return false
