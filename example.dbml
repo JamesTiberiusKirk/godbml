@@ -1,0 +1,772 @@
+// Swagemill v1 ERD — DBML
+// Generated 2026-04-28 from docs/erd.md (Postgres-flavoured DBML).
+//
+// DBML compatibility notes:
+//   - Partial indexes ("WHERE ...") are not expressible in DBML; we drop the WHERE clause and add a Note.
+//   - CHECK constraints are not expressible in DBML; we use enum types where the CHECK is an enum,
+//     and add Note comments otherwise.
+//   - Composite FKs use the `Ref: a.(x, y) > b.(x, y)` syntax.
+//   - GIN / partial / functional indexes simplify to plain Indexes + Note.
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum mode_enum {
+  test
+  live
+}
+
+enum product_status {
+  draft
+  active
+  archived
+}
+
+enum fulfillment_type_enum {
+  physical
+  digital
+}
+
+enum prices_kind {
+  one_time
+  subscription
+}
+
+enum order_status {
+  pending
+  paid
+  refunded
+  cancelled
+}
+
+enum order_lines_kind {
+  product
+  shipping
+  discount
+  adjustment
+}
+
+enum subscription_status {
+  incomplete
+  incomplete_expired
+  active
+  past_due
+  unpaid
+  cancelled
+}
+
+enum interval_unit_enum {
+  day
+  week
+  month
+  year
+}
+
+enum billing_status_enum {
+  active
+  past_due
+  unpaid
+  cancelled
+}
+
+enum stripe_account_status_enum {
+  active
+  restricted
+  deauthorized
+}
+
+enum cart_mode_enum {
+  one_time
+  subscription
+}
+
+enum image_source {
+  upload
+  external
+}
+
+enum refund_source {
+  platform
+  stripe_dashboard
+  out_of_band
+}
+
+enum refund_status {
+  pending
+  confirmed
+  failed
+}
+
+enum dispute_status_enum {
+  open
+  updated
+  won
+  lost
+  withdrawn
+}
+
+enum delivery_status {
+  pending
+  delivered
+  failed
+  permanent_failure
+}
+
+enum webhook_processing_status {
+  pending
+  processed
+  failed_permanent
+}
+
+enum actor_type {
+  system
+  merchant
+  customer
+  stripe_webhook
+}
+
+// ============================================================================
+// 1. ACCOUNT & AUTH
+// ============================================================================
+
+Table accounts {
+  id         uuid [pk, default: `gen_random_uuid()`]
+  name       text [not null]
+  created_at timestamptz [not null, default: `now()`]
+}
+
+Table operators {
+  id               uuid [pk, default: `gen_random_uuid()`]
+  email            text [not null, unique]
+  password_hash    text [not null]
+  name             text
+  role             text [not null, default: 'admin', note: 'v1: admin only; v2 expands; no DB CHECK']
+  security_version int  [not null, default: 1]
+  active           bool [not null, default: `true`]
+  created_at       timestamptz [not null, default: `now()`]
+}
+
+Table operator_sessions {
+  id          uuid [pk, default: `gen_random_uuid()`]
+  operator_id uuid [not null, ref: > operators.id]
+  token       text [not null, unique]
+  expires_at  timestamptz [not null]
+  created_at  timestamptz [not null, default: `now()`]
+
+  Indexes {
+    operator_id [name: 'idx_operator_sessions_op']
+  }
+}
+
+Table operator_remembered_devices {
+  id           uuid [pk, default: `gen_random_uuid()`]
+  operator_id  uuid [not null, ref: > operators.id]
+  device_label text
+  cookie_id    text [not null, unique]
+  created_at   timestamptz [not null, default: `now()`]
+  last_used_at timestamptz [not null, default: `now()`]
+  revoked_at   timestamptz [note: 'null = active']
+
+  Indexes {
+    operator_id [name: 'idx_operator_remembered_devices_op', note: 'partial: WHERE revoked_at IS NULL']
+  }
+}
+
+Table merchant_users {
+  id               uuid [pk, default: `gen_random_uuid()`]
+  account_id       uuid [not null, ref: > accounts.id]
+  email            text [not null]
+  password_hash    text [not null]
+  name             text
+  role             text [not null, default: 'owner', note: 'v1: owner only; v2 expands; no DB CHECK']
+  security_version int  [not null, default: 1]
+  active           bool [not null, default: `true`]
+  created_at       timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (account_id, email) [unique]
+  }
+}
+
+Table merchant_remembered_devices {
+  id               uuid [pk, default: `gen_random_uuid()`]
+  merchant_user_id uuid [not null, ref: > merchant_users.id]
+  device_label     text
+  cookie_id        text [not null, unique]
+  created_at       timestamptz [not null, default: `now()`]
+  last_used_at     timestamptz [not null, default: `now()`]
+  revoked_at       timestamptz [note: 'null = active']
+
+  Indexes {
+    merchant_user_id [name: 'idx_merchant_remembered_devices_user', note: 'partial: WHERE revoked_at IS NULL']
+  }
+}
+
+// ============================================================================
+// 2. SITES & API KEYS
+// ============================================================================
+
+Table sites {
+  id                                   uuid [pk, default: `gen_random_uuid()`]
+  account_id                           uuid [not null, ref: > accounts.id]
+  name                                 text [not null]
+  stripe_account_id                    text
+
+  mode                                 mode_enum [not null, default: 'test']
+  billing_status                       billing_status_enum [not null, default: 'active']
+  stripe_account_status                stripe_account_status_enum [not null, default: 'active']
+
+  application_fee_percent_one_time     numeric [not null, default: 2.0]
+  application_fee_percent_subscription numeric [not null, default: 2.0]
+  allowed_subscription_intervals       jsonb [not null, default: `'[]'::jsonb`]
+  subscription_decrements_inventory    bool [not null, default: `true`]
+  refund_cancels_subscription          bool [not null, default: `true`]
+  refund_application_fee_default       bool [not null, default: `true`]
+
+  allowed_countries                    "text[]" [not null, default: `'{}'`]
+  shipping_origin_country              text
+  shipping_origin_postcode             text
+
+  refund_window_days                   int [note: 'null = Stripe 120-day cap']
+  refunds_enabled                      bool [not null, default: `true`]
+  checkout_session_timeout_minutes     int [not null, default: 30, note: 'CHECK 30..1440']
+  cart_purge_inactivity_days           int [not null, default: 30, note: 'CHECK >= 1']
+
+  email_cap_per_month                  int [not null, default: 1000]
+
+  created_at                           timestamptz [not null, default: `now()`]
+
+  Indexes {
+    account_id [name: 'idx_sites_account']
+    stripe_account_id [name: 'idx_sites_stripe_account', note: 'partial: WHERE NOT NULL']
+  }
+}
+
+Table merchant_sessions {
+  id               uuid [pk, default: `gen_random_uuid()`]
+  merchant_user_id uuid [not null, ref: > merchant_users.id]
+  token            text [not null, unique]
+  selected_site_id uuid [ref: > sites.id]
+  selected_mode    mode_enum [not null, default: 'test']
+  expires_at       timestamptz [not null]
+  created_at       timestamptz [not null, default: `now()`]
+
+  Indexes {
+    merchant_user_id [name: 'idx_merchant_sessions_user']
+  }
+}
+
+Table api_keys {
+  id           uuid [pk, default: `gen_random_uuid()`]
+  site_id      uuid [not null, ref: > sites.id]
+  label        text [not null]
+  key_hash     text [not null, unique]
+  key_last4    text [not null]
+  mode         mode_enum [not null]
+  revoked_at   timestamptz
+  created_at   timestamptz [not null, default: `now()`]
+  last_used_at timestamptz
+
+  Indexes {
+    site_id [name: 'idx_api_keys_site_active', note: 'partial: WHERE revoked_at IS NULL']
+  }
+}
+
+// ============================================================================
+// 3. CUSTOMERS
+// ============================================================================
+
+Table customers {
+  id                 uuid [pk, default: `gen_random_uuid()`]
+  site_id            uuid [not null, ref: > sites.id]
+  external_user_id   text [not null]
+  stripe_customer_id text
+  email              text
+  metadata           jsonb [not null, default: `'{}'::jsonb`]
+  created_at         timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (site_id, external_user_id) [unique]
+    (site_id, email) [name: 'idx_customers_email', note: 'partial: WHERE email IS NOT NULL']
+    stripe_customer_id [name: 'idx_customers_stripe', note: 'partial: WHERE NOT NULL']
+  }
+}
+
+// ============================================================================
+// 4. CATALOG
+// ============================================================================
+
+Table products {
+  id                              uuid [pk, default: `gen_random_uuid()`]
+  site_id                         uuid [not null, ref: > sites.id]
+  name                            text [not null]
+  short_description               text
+  full_description                text
+  status                          product_status [not null, default: 'draft']
+  featured                        bool [not null, default: `false`]
+  url                             text
+  fulfillment_type                fulfillment_type_enum [not null]
+  sku                             text
+  subscribable                    bool [not null, default: `false`]
+  allowed_subscription_intervals  jsonb
+  metadata                        jsonb [not null, default: `'{}'::jsonb`]
+  created_at                      timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (site_id, sku) [unique, name: 'ux_products_sku', note: 'partial: WHERE sku IS NOT NULL']
+    (site_id, status) [name: 'idx_products_site_status']
+    site_id [name: 'idx_products_featured', note: 'partial: WHERE featured AND status=active']
+  }
+}
+
+Table variants {
+  id           uuid [pk, default: `gen_random_uuid()`]
+  site_id      uuid [not null, ref: > sites.id]
+  product_id   uuid [not null, ref: > products.id]
+  name         text [note: 'null = use product name fallback']
+  sku          text
+  weight_grams int  [note: 'required for shipping rate lookup if cart uses methods']
+  metadata     jsonb [not null, default: `'{}'::jsonb`]
+  created_at   timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (site_id, sku) [unique, name: 'ux_variants_sku', note: 'partial: WHERE sku IS NOT NULL']
+    product_id [name: 'idx_variants_product']
+  }
+}
+
+Table prices {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  site_id         uuid [not null, ref: > sites.id]
+  variant_id      uuid [not null, ref: > variants.id]
+  currency        text [not null, default: 'GBP']
+  kind            prices_kind [not null]
+  unit_amount     int [not null, note: 'pence']
+  stripe_price_id text
+  active          bool [not null, default: `true`]
+  created_at      timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (variant_id, currency, kind) [unique, name: 'ux_prices_active', note: 'partial: WHERE active = true']
+    stripe_price_id [name: 'idx_prices_stripe', note: 'partial: WHERE NOT NULL']
+  }
+}
+
+Table categories {
+  id         uuid [pk, default: `gen_random_uuid()`]
+  site_id    uuid [not null, ref: > sites.id]
+  name       text [not null]
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (site_id, name) [unique]
+  }
+}
+
+Table product_categories {
+  product_id  uuid [not null, ref: > products.id]
+  category_id uuid [not null, ref: > categories.id]
+  site_id     uuid [not null, ref: > sites.id]
+  created_at  timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (product_id, category_id) [pk]
+    category_id [name: 'idx_product_categories_category']
+    site_id [name: 'idx_product_categories_site']
+  }
+}
+
+Table product_images {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  product_id    uuid [not null, ref: > products.id]
+  site_id       uuid [not null, ref: > sites.id]
+  source        image_source [not null]
+  hamr_image_id text [note: 'set when source=upload']
+  external_url  text [note: 'set when source=external']
+  alt           text
+  sort_order    int [not null, default: 0]
+  created_at    timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (product_id, sort_order) [name: 'idx_product_images_product']
+  }
+  Note: 'CHECK ((source=upload AND hamr_image_id NOT NULL AND external_url NULL) OR (source=external AND external_url NOT NULL AND hamr_image_id NULL))'
+}
+
+// ============================================================================
+// 5. INVENTORY
+// ============================================================================
+
+Table inventory {
+  variant_id uuid [not null, ref: > variants.id]
+  site_id    uuid [not null, ref: > sites.id]
+  mode       mode_enum [not null]
+  stock      int [note: 'null = untracked / infinite; CHECK stock IS NULL OR stock >= 0']
+
+  Indexes {
+    (variant_id, mode) [pk]
+  }
+}
+
+// ============================================================================
+// 6. SHIPPING
+// ============================================================================
+
+Table shipping_zones {
+  id         uuid [pk, default: `gen_random_uuid()`]
+  site_id    uuid [not null, ref: > sites.id]
+  name       text [not null]
+  countries  "text[]" [not null, default: `'{}'`]
+  sort_order int [not null, default: 0]
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (site_id, name) [unique]
+    countries [name: 'idx_shipping_zones_countries', type: gin]
+  }
+}
+
+Table shipping_methods {
+  id          uuid [pk, default: `gen_random_uuid()`]
+  site_id     uuid [not null, ref: > sites.id]
+  zone_id     uuid [not null, ref: > shipping_zones.id]
+  name        text [not null]
+  description text
+  enabled     bool [not null, default: `true`]
+  sort_order  int [not null, default: 0]
+  created_at  timestamptz [not null, default: `now()`]
+
+  Indexes {
+    zone_id [name: 'idx_shipping_methods_zone', note: 'partial: WHERE enabled = true']
+  }
+}
+
+Table shipping_rates {
+  id                 uuid [pk, default: `gen_random_uuid()`]
+  site_id            uuid [not null, ref: > sites.id]
+  method_id          uuid [not null, ref: > shipping_methods.id]
+  weight_min_g       int [not null, default: 0]
+  weight_max_g       int [note: 'null = no upper bound']
+  amount             int [not null, note: 'pence']
+  free_over_subtotal int
+  created_at         timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (method_id, weight_min_g) [name: 'idx_shipping_rates_method']
+  }
+}
+
+// ============================================================================
+// 7. SUBSCRIPTIONS
+// ============================================================================
+
+Table subscriptions {
+  id                     uuid [pk, default: `gen_random_uuid()`]
+  site_id                uuid [not null, ref: > sites.id]
+  customer_id            uuid [not null, ref: > customers.id]
+  mode                   mode_enum [not null]
+  stripe_subscription_id text [not null]
+  interval_unit          interval_unit_enum [not null]
+  interval_count         int [not null, note: 'CHECK > 0']
+  status                 subscription_status [not null]
+  cancel_at_period_end   bool [not null, default: `false`]
+  skipped_until          timestamptz
+  current_period_start   timestamptz
+  current_period_end     timestamptz
+  cancelled_at           timestamptz
+  shipping_address       jsonb [note: 'mutable; HAMR updates on customer house move']
+  created_at             timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (stripe_subscription_id, mode) [unique]
+    (id, mode) [unique, note: 'backs composite FK from orders']
+    customer_id [name: 'idx_subscriptions_customer']
+    (site_id, status) [name: 'idx_subscriptions_status']
+  }
+}
+
+// ============================================================================
+// 8. CART & CART_ITEMS
+// ============================================================================
+
+Table carts {
+  id                 uuid [pk, default: `gen_random_uuid()`]
+  site_id            uuid [not null, ref: > sites.id]
+  customer_id        uuid [ref: > customers.id]
+  mode               mode_enum [not null, default: 'test']
+  cart_mode          cart_mode_enum [note: 'null until customer chooses']
+  interval           jsonb [note: '{unit, count} when sub mode set']
+  shipping_address   jsonb
+  shipping_method_id uuid [ref: > shipping_methods.id]
+  shipping_amount    int
+  currency           text [not null, default: 'GBP']
+  discount_code      text
+  created_at         timestamptz [not null, default: `now()`]
+  updated_at         timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (id, mode) [unique, note: 'backs composite FK from cart_items']
+    customer_id [name: 'idx_carts_customer', note: 'partial: WHERE NOT NULL']
+    updated_at [name: 'idx_carts_inactivity']
+  }
+}
+
+Table cart_items {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  cart_id         uuid [not null]
+  mode            mode_enum [not null]
+  site_id         uuid [not null, ref: > sites.id]
+  kind            order_lines_kind [not null]
+  variant_id      uuid [ref: > variants.id, note: 'set for kind=product only']
+  quantity        int
+  unit_amount     int
+  discount_amount int
+  amount          int [not null, note: 'always positive; sign by kind']
+  currency        text [not null]
+  price_id        uuid [ref: > prices.id]
+  created_at      timestamptz [not null, default: `now()`]
+
+  Indexes {
+    cart_id [name: 'idx_cart_items_cart']
+  }
+}
+Ref: cart_items.(cart_id, mode) > carts.(id, mode)  // composite FK; mode-consistency
+
+// ============================================================================
+// 9. ORDERS & ORDER_LINES
+// ============================================================================
+
+Table orders {
+  id                       uuid [pk, default: `gen_random_uuid()`]
+  site_id                  uuid [not null, ref: > sites.id]
+  customer_id              uuid [not null, ref: > customers.id]
+  mode                     mode_enum [not null]
+  subscription_id          uuid [note: 'null = one-time; set = sub cycle']
+  status                   order_status [not null, default: 'pending']
+  currency                 text [not null, default: 'GBP']
+
+  refunded_amount          int [not null, default: 0]
+  refund_count             int [not null, default: 0]
+  fully_refunded           bool [not null, default: `false`]
+  dispute_status           text
+  paid_at                  timestamptz
+  cancelled_at             timestamptz
+  refunded_at              timestamptz
+
+  shipping_address         jsonb
+
+  stripe_payment_intent_id text
+  stripe_invoice_id        text
+
+  created_at               timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (id, mode) [unique, note: 'backs composite FK from order_lines/refunds/disputes']
+    customer_id [name: 'idx_orders_customer']
+    subscription_id [name: 'idx_orders_subscription', note: 'partial: WHERE NOT NULL']
+    (site_id, status) [name: 'idx_orders_site_status']
+    (site_id, paid_at) [name: 'idx_orders_paid', note: 'partial: WHERE status=paid']
+  }
+}
+Ref: orders.(subscription_id, mode) > subscriptions.(id, mode)  // composite FK
+
+Table order_lines {
+  id                  uuid [pk, default: `gen_random_uuid()`]
+  order_id            uuid [not null]
+  mode                mode_enum [not null]
+  site_id             uuid [not null, ref: > sites.id]
+  kind                order_lines_kind [not null]
+  variant_id          uuid [ref: > variants.id, note: 'set for kind=product only']
+  quantity            int
+  unit_amount         int
+  discount_amount     int
+  amount              int [not null]
+  currency            text [not null]
+  price_id            uuid [ref: > prices.id]
+
+  fulfilled_at        timestamptz
+  shipped_at          timestamptz
+  fulfilment_tracking jsonb [note: '{carrier, tracking_number, tracking_url}']
+
+  created_at          timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (id, mode) [unique]
+    order_id [name: 'idx_order_lines_order']
+    order_id [name: 'idx_order_lines_unfulfilled', note: 'partial: WHERE kind=product AND fulfilled_at IS NULL']
+  }
+}
+Ref: order_lines.(order_id, mode) > orders.(id, mode)  // composite FK
+
+// ============================================================================
+// 10. REFUNDS & DISPUTES
+// ============================================================================
+
+Table refunds {
+  id                      uuid [pk, default: `gen_random_uuid()`]
+  site_id                 uuid [not null, ref: > sites.id]
+  order_id                uuid [not null]
+  customer_id             uuid [not null, ref: > customers.id]
+  mode                    mode_enum [not null]
+  source                  refund_source [not null]
+  status                  refund_status [not null]
+  stripe_refund_id        text
+  policy_violation        bool [not null, default: `false`]
+  refund_application_fee  bool [note: 'per-refund override; null = follow site default']
+  reverse_transfer_failed bool [not null, default: `false`]
+  notes                   text
+  created_at              timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (id, mode) [unique]
+    order_id [name: 'idx_refunds_order']
+    (stripe_refund_id, mode) [unique, name: 'ux_refunds_stripe', note: 'partial: WHERE stripe_refund_id IS NOT NULL']
+  }
+}
+Ref: refunds.(order_id,mode) > orders.(id, mode)  // composite FK
+
+Table refund_lines {
+  id            uuid [pk, default: `gen_random_uuid()`]
+  refund_id     uuid [not null]
+  mode          mode_enum [not null]
+  order_line_id uuid [not null]
+  quantity      int [note: 'set for kind=product only']
+  amount        int [not null, note: 'pence; always positive']
+  created_at    timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (refund_id, order_line_id) [unique]
+    refund_id [name: 'idx_refund_lines_refund']
+    order_line_id [name: 'idx_refund_lines_order_line']
+  }
+}
+Ref: refund_lines.(refund_id, mode) > refunds.(id,mode)
+Ref: refund_lines.(order_line_id, mode) > order_lines.(id, mode)
+
+Table disputes {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  site_id           uuid [not null, ref: > sites.id]
+  order_id          uuid [not null]
+  mode              mode_enum [not null]
+  stripe_dispute_id text [not null]
+  status            dispute_status_enum [not null]
+  amount            int [not null]
+  reason            text
+  opened_at         timestamptz [not null]
+  closed_at         timestamptz
+  created_at        timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (stripe_dispute_id, mode) [unique]
+    order_id [name: 'idx_disputes_order']
+    (site_id, status) [name: 'idx_disputes_status']
+  }
+}
+Ref: disputes.(order_id, mode) > orders.(id, mode)
+
+// ============================================================================
+// 11. EVENTS & WEBHOOKS
+// ============================================================================
+
+Table events {
+  id         uuid [pk, default: `gen_random_uuid()`]
+  site_id    uuid [not null, ref: > sites.id]
+  mode       mode_enum [not null]
+  event_type text [not null]
+  payload    jsonb [not null]
+  actor_type actor_type [not null]
+  actor_id   text
+  created_at timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (id, mode) [unique]
+    (site_id, event_type, created_at) [name: 'idx_events_site_type_created']
+    created_at [name: 'idx_events_created']
+  }
+}
+
+Table event_deliveries {
+  id              uuid [pk, default: `gen_random_uuid()`]
+  event_id        uuid [not null]
+  mode            mode_enum [not null]
+  subscriber      text [not null]
+  status          delivery_status [not null]
+  attempts        int [not null, default: 0]
+  next_attempt_at timestamptz
+  last_error      text
+  delivered_at    timestamptz
+  created_at      timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (event_id, subscriber) [unique]
+    next_attempt_at [name: 'idx_event_deliveries_pending', note: 'partial: WHERE status IN (pending, failed)']
+  }
+}
+Ref: event_deliveries.(event_id, mode) > events.(id, mode)
+
+Table webhook_receipts {
+  id                uuid [pk, default: `gen_random_uuid()`]
+  provider          text [not null]
+  external_id       text [not null]
+  mode              mode_enum [not null]
+  payload           jsonb [not null]
+  received_at       timestamptz [not null, default: `now()`]
+  processing_status webhook_processing_status [not null]
+  processed_at      timestamptz
+  last_error        text
+  attempts          int [not null, default: 0]
+
+  Indexes {
+    (provider, external_id, mode) [unique]
+    received_at [name: 'idx_webhook_receipts_pending', note: 'partial: WHERE processing_status = pending']
+  }
+  Note: 'Provider-scoped (no site_id); inbox dedup before site is known. Mode stamped from verifying signing secret.'
+}
+
+Table webhook_subscriptions {
+  id             uuid [pk, default: `gen_random_uuid()`]
+  site_id        uuid [not null, ref: > sites.id]
+  url            text [not null]
+  secret         text [not null]
+  api_version    text [not null, default: 'v1']
+  enabled_events "text[]" [not null, default: `'{}'`]
+  enabled        bool [not null, default: `true`]
+  description    text
+  created_at     timestamptz [not null, default: `now()`]
+  updated_at     timestamptz [not null, default: `now()`]
+
+  Indexes {
+    site_id [name: 'idx_webhook_subscriptions_site', note: 'partial: WHERE enabled = true']
+  }
+}
+
+// ============================================================================
+// 12. EMAIL & USAGE
+// ============================================================================
+
+Table email_templates {
+  id                 uuid [pk, default: `gen_random_uuid()`]
+  site_id            uuid [not null, ref: > sites.id]
+  template_key       text [not null]
+  enabled            bool [not null, default: `true`]
+  subject_override   text
+  text_block_welcome text
+  text_block_footer  text
+  created_at         timestamptz [not null, default: `now()`]
+  updated_at         timestamptz [not null, default: `now()`]
+
+  Indexes {
+    (site_id, template_key) [unique]
+  }
+}
+
+Table site_email_usage {
+  site_id    uuid [not null, ref: > sites.id]
+  year_month text [not null]
+  count_sent int [not null, default: 0]
+
+  Indexes {
+    (site_id, year_month) [pk]
+  }
+}

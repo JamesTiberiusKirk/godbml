@@ -1,0 +1,46 @@
+Project godbml_example {
+  database_type: 'PostgreSQL'
+  Note: 'Sample schema covering tables, columns, refs, enums, table groups.'
+}
+
+Table users {
+  id integer [primary key, increment]
+  username varchar [unique, not null]
+  role user_role [not null]
+  created_at timestamp [default: `now()`]
+
+  Note: 'Application users.'
+}
+
+Table sessions {
+  id integer [primary key]
+  user_id integer [ref: > users.id, not null]
+  token varchar(255) [unique, not null]
+  expires_at timestamp [not null]
+}
+
+Table posts {
+  id integer [primary key]
+  author_id integer [not null]
+  title varchar
+  body text
+  created_at timestamp
+
+  indexes {
+    (author_id, created_at) [name: 'posts_author_created_idx']
+    title [type: btree]
+  }
+}
+
+Ref: posts.author_id > users.id
+
+Enum user_role {
+  admin
+  member
+  guest [Note: 'limited access']
+}
+
+TableGroup auth {
+  users
+  sessions
+}
