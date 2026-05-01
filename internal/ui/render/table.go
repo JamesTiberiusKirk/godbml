@@ -28,7 +28,10 @@ func (b TableBox) Contains(x, y float64) bool {
 }
 
 func MeasureTable(t *dbml.Table) TableBox {
-	maxRow := TextWidth(t.Name)
+	// Header uses a larger font face than column rows, so it must be measured
+	// with the header face — otherwise long names like
+	// `operator_remembered_devices` get clipped.
+	maxRow := HeaderTextWidth(t.Name)
 	for _, c := range t.Columns {
 		w := TextWidth(c.Name + "  " + c.Type)
 		if c.PK {

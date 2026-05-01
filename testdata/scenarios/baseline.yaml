@@ -1,0 +1,39 @@
+# Baseline visual scenario: every read-only state we care about, captured.
+# Run: go run ./cmd/godbml-test testdata/scenarios/baseline.yaml
+# PNGs land in testdata/scenarios/shots-baseline/.
+
+schema: testdata/example.dbml
+window:
+  width: 1280
+  height: 800
+out_dir: testdata/scenarios/shots-baseline
+
+steps:
+  - camera: { fit: true }
+  - shoot: 00-fitted.png
+
+  - hover_table: users
+  - shoot: 01-hover-users.png
+
+  - hover_table: ""
+  - hover_group: auth
+  - shoot: 02-hover-group-auth.png
+
+  - hover_group: ""
+  - select_tables: [users]
+  - shoot: 03-select-single.png
+
+  - select_tables: [users, posts]
+  - shoot: 04-select-multi.png
+
+  - clear_selection: true
+  - select_tables: [users]
+  - advance_frames: 60          # let pulses progress mid-cycle
+  - shoot: 05-pulse-mid.png
+
+  - clear_selection: true
+  - camera: { x: -200, y: -100, zoom: 0.5 }
+  - shoot: 06-zoomed-out.png
+
+  - camera: { x: -50, y: -50, zoom: 2.0 }
+  - shoot: 07-zoomed-in.png

@@ -1,10 +1,12 @@
 package ui
 
 import (
+	"bytes"
 	"fmt"
 	"image/color"
 	"log"
 	"math"
+	"os"
 	"sort"
 
 	"github.com/hajimehoshi/ebiten/v2"
@@ -41,6 +43,20 @@ type App struct {
 	lastMidPanX   int
 	lastMidPanY   int
 
+	// Ctrl + left-drag also pans the canvas (alternative for users on
+	// trackpads or mice without a middle button). Ctrl + click without
+	// dragging is a different intent — toggle-select what's under cursor —
+	// so we defer the decision until we see whether they move past the
+	// drag threshold. maybeCtrlPan = ambiguous; ctrlPanning = confirmed pan.
+	maybeCtrlPan    bool
+	ctrlPanning     bool
+	ctrlPanStartMX  int
+	ctrlPanStartMY  int
+	lastCtrlPanX    int
+	lastCtrlPanY    int
+	ctrlClickWX     float64
+	ctrlClickWY     float64
+
 	// Left-drag on empty canvas opens a rubber-band selection box. Until the
 	// cursor moves past selectMoveThreshold, the press is treated as a plain
 	// click that preserves the existing selection.
@@ -59,9 +75,18 @@ type App struct {
 	dragStartTablePositions map[string][2]float64
 	dragStartAnnoPositions  map[string][2]float64
 
-	hoveredTable   string
-	hoveredGroup   string
-	selectedTables map[string]bool
+	hoveredTable        string
+	hoveredGroup        string
+	hoveredGroupMembers map[string]bool
+	selectedTables      map[string]bool
+
+	tableIdx   map[string]*dbml.Table
+	tableSizes map[string]render.TableBox
+
+	cachedView *meta.View // currentView() memoization; valid while ID==activeViewID
+
+	dbmlBytes []byte   // in-memory mirror of the DBML source on disk
+	history   *history // undo/redo stack, holds (dbmlBytes + document) snapshots
 
 	dirty bool
 
@@ -153,25 +178,38 @@ func (a *App) isAnnoSelected(id string) bool    { return a.selectedAnnos[id] }
 // either directly hovering the table card, or hovering a group whose members
 // include this table. Group-hover acts as a soft-selection so users can
 // preview a group's connections at a glance.
+//
+// Cheap O(1) — driven by the precomputed hoveredGroupMembers set rather than
+// scanning groups on every call (this is invoked per relationship per frame).
 func (a *App) isTableHovered(name string) bool {
 	if a.hoveredTable == name {
 		return true
 	}
-	if a.hoveredGroup == "" {
-		return false
+	return a.hoveredGroupMembers[name]
+}
+
+// setHoveredGroup updates the hover-group state plus the precomputed members
+// set used by hover hot-path lookups.
+func (a *App) setHoveredGroup(gid string) {
+	if gid == a.hoveredGroup {
+		return
+	}
+	a.hoveredGroup = gid
+	if gid == "" {
+		a.hoveredGroupMembers = nil
+		return
 	}
 	for _, g := range a.currentView().Groups {
-		if g.ID != a.hoveredGroup {
-			continue
-		}
-		for _, m := range g.Tables {
-			if m == name {
-				return true
+		if g.ID == gid {
+			members := make(map[string]bool, len(g.Tables))
+			for _, m := range g.Tables {
+				members[m] = true
 			}
+			a.hoveredGroupMembers = members
+			return
 		}
-		return false
 	}
-	return false
+	a.hoveredGroupMembers = nil
 }
 
 func (a *App) selectedTablesList() []string {
@@ -239,10 +277,7 @@ func (a *App) newGroupFromSelection() {
 		Name:   nextGroupName(view.Groups),
 		Tables: members,
 	})
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 }
 
 func (a *App) addSelectionToGroup(groupID string) {
@@ -261,10 +296,7 @@ func (a *App) addSelectionToGroup(groupID string) {
 				existing[n] = true
 			}
 		}
-		a.dirty = true
-		if err := a.persist(); err != nil {
-			log.Printf("persist: %v", err)
-		}
+		a.commit()
 		return
 	}
 }
@@ -283,10 +315,7 @@ func (a *App) removeSelectionFromGroup(groupID string) {
 			}
 		}
 		g.Tables = out
-		a.dirty = true
-		if err := a.persist(); err != nil {
-			log.Printf("persist: %v", err)
-		}
+		a.commit()
 		return
 	}
 }
@@ -320,7 +349,7 @@ func (a *App) applyBoxSelection() {
 		if !ok || p.Hidden || p.Orphaned {
 			continue
 		}
-		box := render.MeasureTable(t)
+		box := a.tableSize(t.Name)
 		if rectsIntersect(p.X, p.Y, p.X+box.W, p.Y+box.H, x0, y0, x1, y1) {
 			tables[t.Name] = true
 		}
@@ -373,6 +402,7 @@ func NewApp(dbmlPath string) (*App, error) {
 		height:   800,
 		dbmlPath: dbmlPath,
 		metaPath: meta.SidecarPath(dbmlPath),
+		history:  newHistory(100),
 	}
 
 	if err := a.reloadDBML(); err != nil {
@@ -382,6 +412,7 @@ func NewApp(dbmlPath string) (*App, error) {
 		return nil, err
 	}
 	a.activeViewID = a.doc.DefaultView().ID
+	a.history.reset(a.snapshot())
 
 	w, err := watch.New(a.dbmlPath, a.metaPath)
 	if err != nil {
@@ -392,12 +423,17 @@ func NewApp(dbmlPath string) (*App, error) {
 }
 
 func (a *App) currentView() *meta.View {
+	if a.cachedView != nil && a.cachedView.ID == a.activeViewID {
+		return a.cachedView
+	}
 	for _, v := range a.doc.Views {
 		if v.ID == a.activeViewID {
+			a.cachedView = v
 			return v
 		}
 	}
-	return a.doc.DefaultView()
+	a.cachedView = a.doc.DefaultView()
+	return a.cachedView
 }
 
 func (a *App) Close() {
@@ -409,12 +445,339 @@ func (a *App) Close() {
 func (a *App) WindowSize() (int, int) { return a.width, a.height }
 
 func (a *App) reloadDBML() error {
-	s, err := dbml.ParseFile(a.dbmlPath)
+	src, err := os.ReadFile(a.dbmlPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", a.dbmlPath, err)
+	}
+	s, err := dbml.Parse(bytes.NewReader(src))
 	if err != nil {
 		return fmt.Errorf("parse %s: %w", a.dbmlPath, err)
 	}
-	a.schema = s
+	external := a.dbmlBytes != nil && !dbmlBytesEqual(a.dbmlBytes, src)
+	a.dbmlBytes = src
+	a.setSchema(s)
+	// External DBML edits invalidate our undo history — the user's other
+	// editor is now the source of truth and undoing across that boundary
+	// could clobber their work.
+	if external && a.history != nil {
+		a.history.reset(a.snapshot())
+	}
 	return nil
+}
+
+// handleKeyboardShortcuts processes app-wide hotkeys. Anything edit-mode
+// related (typing into rename / annotation buffers) is handled in the
+// dedicated edit-mode update functions before this is reached.
+func (a *App) handleKeyboardShortcuts() {
+	if inpututil.IsKeyJustPressed(ebiten.KeyF) {
+		a.fitToTables()
+	}
+
+	ctrl := ebiten.IsKeyPressed(ebiten.KeyControl) || ebiten.IsKeyPressed(ebiten.KeyMeta)
+	shift := ebiten.IsKeyPressed(ebiten.KeyShift)
+
+	// Ctrl-Z = undo, Ctrl-Shift-Z = redo.
+	if inpututil.IsKeyJustPressed(ebiten.KeyZ) {
+		switch {
+		case ctrl && shift:
+			a.Redo()
+		case ctrl:
+			a.Undo()
+		}
+	}
+
+	// Ctrl-A = select all visible tables + annotations in the current view.
+	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyA) {
+		a.selectAllVisible()
+	}
+
+	// Escape: cancel any open menu/palette, else clear selection.
+	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+		switch {
+		case a.menu != nil:
+			a.menu = nil
+		case a.palette != nil:
+			a.palette = nil
+			a.paletteCallback = nil
+		default:
+			a.ClearSelection()
+		}
+	}
+
+	// Delete / Backspace: remove every selected table and annotation.
+	if inpututil.IsKeyJustPressed(ebiten.KeyDelete) || inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
+		if a.selectionSize() > 0 {
+			a.deleteSelection()
+		}
+	}
+
+	// Arrow keys: nudge selected items. Shift = larger step.
+	step := 4.0
+	if shift {
+		step = 32.0
+	}
+	dx, dy := 0.0, 0.0
+	if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
+		dx = -step
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
+		dx = step
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) {
+		dy = -step
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyArrowDown) {
+		dy = step
+	}
+	if dx != 0 || dy != 0 {
+		a.nudgeSelection(dx, dy)
+	}
+}
+
+// toggleSelectAt toggles whatever is under (wx, wy) in/out of the current
+// selection. Used by Ctrl-click — the user expects additive selection, not
+// "select only this".
+func (a *App) toggleSelectAt(wx, wy float64) {
+	if id, _ := a.annotationAt(wx, wy); id != "" {
+		if a.selectedAnnos == nil {
+			a.selectedAnnos = map[string]bool{}
+		}
+		if a.selectedAnnos[id] {
+			delete(a.selectedAnnos, id)
+		} else {
+			a.selectedAnnos[id] = true
+		}
+		return
+	}
+	if name := a.tableAtWorld(wx, wy); name != "" {
+		if a.selectedTables == nil {
+			a.selectedTables = map[string]bool{}
+		}
+		if a.selectedTables[name] {
+			delete(a.selectedTables, name)
+		} else {
+			a.selectedTables[name] = true
+		}
+		return
+	}
+	if gid := a.groupLabelAtWorld(wx, wy); gid != "" {
+		// Toggle the union of group members in/out of selection. If they're
+		// all in, remove them all; otherwise add the missing ones.
+		for _, g := range a.currentView().Groups {
+			if g.ID != gid {
+				continue
+			}
+			allIn := true
+			for _, m := range g.Tables {
+				if !a.selectedTables[m] {
+					allIn = false
+					break
+				}
+			}
+			if a.selectedTables == nil {
+				a.selectedTables = map[string]bool{}
+			}
+			if allIn {
+				for _, m := range g.Tables {
+					delete(a.selectedTables, m)
+				}
+			} else {
+				for _, m := range g.Tables {
+					a.selectedTables[m] = true
+				}
+			}
+			return
+		}
+	}
+}
+
+// selectAllVisible selects every non-hidden table and every annotation in
+// the active view.
+func (a *App) selectAllVisible() {
+	view := a.currentView()
+	tables := map[string]bool{}
+	for name, p := range view.Tables {
+		if p.Hidden || p.Orphaned {
+			continue
+		}
+		if _, ok := a.tableIdx[name]; !ok {
+			continue
+		}
+		tables[name] = true
+	}
+	annos := map[string]bool{}
+	for _, an := range view.Annotations {
+		annos[an.ID] = true
+	}
+	a.selectedTables = tables
+	a.selectedAnnos = annos
+}
+
+// deleteSelection removes every selected table (via dbmledit) and every
+// selected annotation (via metadata). Tables are removed serially; each
+// removal handles its own ref propagation. Annotations are metadata-only.
+func (a *App) deleteSelection() {
+	for _, name := range a.selectedTablesList() {
+		a.removeTable(name)
+	}
+	for _, id := range a.selectedAnnosList() {
+		a.deleteAnnotation(id)
+	}
+}
+
+// nudgeSelection moves all selected tables and annotations by (dx, dy) in
+// world units. Issues a single commit at the end so undo treats it as one
+// atomic step.
+func (a *App) nudgeSelection(dx, dy float64) {
+	if len(a.selectedTables) == 0 && len(a.selectedAnnos) == 0 {
+		return
+	}
+	view := a.currentView()
+	moved := false
+	for name := range a.selectedTables {
+		if p, ok := view.Tables[name]; ok && !p.Hidden && !p.Orphaned {
+			p.X += dx
+			p.Y += dy
+			moved = true
+		}
+	}
+	for id := range a.selectedAnnos {
+		for _, an := range view.Annotations {
+			if an.ID == id {
+				an.X += dx
+				an.Y += dy
+				moved = true
+				break
+			}
+		}
+	}
+	if moved {
+		a.dirty = true
+		a.commit()
+	}
+}
+
+// snapshot captures the current world state (DBML bytes + document clone).
+func (a *App) snapshot() snapshot {
+	bs := append([]byte(nil), a.dbmlBytes...)
+	return snapshot{DBMLBytes: bs, Document: cloneDocument(a.doc)}
+}
+
+// commit persists the sidecar and pushes a new history snapshot. Use this
+// instead of bare a.persist() for any user action that mutates state.
+func (a *App) commit() {
+	if err := a.persist(); err != nil {
+		log.Printf("persist: %v", err)
+		return
+	}
+	if a.history != nil {
+		a.history.push(a.snapshot())
+	}
+}
+
+// commitAfterDBMLEdit is called after a successful dbmledit operation. The
+// DBML bytes have changed (and were already written to disk by dbmledit's
+// commit), so we update our in-memory mirror, persist the sidecar, and
+// snapshot the combined new state.
+func (a *App) commitAfterDBMLEdit(newBytes []byte) {
+	if newBytes != nil {
+		a.dbmlBytes = append([]byte(nil), newBytes...)
+	}
+	if err := a.persist(); err != nil {
+		log.Printf("persist: %v", err)
+		return
+	}
+	if a.history != nil {
+		a.history.push(a.snapshot())
+	}
+}
+
+// Undo restores the world to the previous snapshot. Both the on-disk DBML
+// file and the sidecar are rewritten so external tools see the rollback too.
+func (a *App) Undo() {
+	if a.history == nil {
+		return
+	}
+	s := a.history.undo()
+	if s == nil {
+		return
+	}
+	a.applySnapshot(*s)
+}
+
+// Redo moves forward one step in the history.
+func (a *App) Redo() {
+	if a.history == nil {
+		return
+	}
+	s := a.history.redo()
+	if s == nil {
+		return
+	}
+	a.applySnapshot(*s)
+}
+
+func (a *App) applySnapshot(s snapshot) {
+	if !dbmlBytesEqual(a.dbmlBytes, s.DBMLBytes) {
+		if err := atomicWriteFile(a.dbmlPath, s.DBMLBytes); err != nil {
+			log.Printf("undo write dbml: %v", err)
+			return
+		}
+		a.dbmlBytes = append([]byte(nil), s.DBMLBytes...)
+		schema, err := dbml.Parse(bytes.NewReader(s.DBMLBytes))
+		if err != nil {
+			log.Printf("undo parse dbml: %v", err)
+			return
+		}
+		a.setSchema(schema)
+	}
+	if s.Document != nil {
+		a.doc = cloneDocument(s.Document)
+		a.cachedView = nil
+	}
+	if err := a.persist(); err != nil {
+		log.Printf("undo persist sidecar: %v", err)
+	}
+}
+
+// atomicWriteFile writes data to path via tempfile + rename so external
+// readers never see a half-written file. Used by undo/redo to reset the
+// DBML source.
+func atomicWriteFile(path string, data []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// setSchema swaps the in-memory schema and rebuilds derived per-schema caches:
+// the table-name index used by hit-testing/rendering, and the per-table size
+// cache that avoids re-running font shaping on every hit-test/draw call.
+func (a *App) setSchema(s *dbml.Schema) {
+	a.schema = s
+	a.tableIdx = make(map[string]*dbml.Table, len(s.Tables))
+	a.tableSizes = make(map[string]render.TableBox, len(s.Tables))
+	for i := range s.Tables {
+		t := &s.Tables[i]
+		a.tableIdx[t.Name] = t
+		a.tableSizes[t.Name] = render.MeasureTable(t)
+	}
+}
+
+// tableByName returns the schema table with the given name or nil. O(1).
+func (a *App) tableByName(name string) *dbml.Table { return a.tableIdx[name] }
+
+// tableSize returns the cached rendered size of a table. Falls back to a
+// fresh measurement if the cache misses (shouldn't happen post-setSchema).
+func (a *App) tableSize(name string) render.TableBox {
+	if box, ok := a.tableSizes[name]; ok {
+		return box
+	}
+	if t := a.tableIdx[name]; t != nil {
+		return render.MeasureTable(t)
+	}
+	return render.TableBox{}
 }
 
 func (a *App) loadOrCreateMeta() error {
@@ -544,6 +907,25 @@ func (a *App) Update() error {
 	}
 	a.middlePanning = false
 
+	// Ctrl + left-drag pan, continuation. Pan as long as left is held.
+	if a.ctrlPanning && ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
+		dx := float64(mx - a.lastCtrlPanX)
+		dy := float64(my - a.lastCtrlPanY)
+		a.camera.Pan(dx, dy)
+		a.lastCtrlPanX, a.lastCtrlPanY = mx, my
+		return nil
+	}
+	// Ctrl-pan: ambiguous press → confirmed drag once we move past threshold.
+	if a.maybeCtrlPan && ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
+		if abs(mx-a.ctrlPanStartMX) >= selectMoveThreshold ||
+			abs(my-a.ctrlPanStartMY) >= selectMoveThreshold {
+			a.maybeCtrlPan = false
+			a.ctrlPanning = true
+			a.lastCtrlPanX, a.lastCtrlPanY = mx, my
+		}
+		return nil
+	}
+
 	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonRight) {
 		if id, _ := a.annotationAt(wx, wy); id != "" {
 			a.menu = a.buildAnnotationMenu(id, mx, my)
@@ -584,6 +966,20 @@ func (a *App) Update() error {
 			a.selectCurMX = mx
 			a.selectCurMY = my
 		default:
+			ctrl := ebiten.IsKeyPressed(ebiten.KeyControl) || ebiten.IsKeyPressed(ebiten.KeyMeta)
+			shift := ebiten.IsKeyPressed(ebiten.KeyShift)
+			additive := ctrl || shift
+
+			// Ctrl + left-press: defer decision until release-vs-drag —
+			// release-without-drag = toggle-select (handled in mouse-up
+			// cleanup); drag-past-threshold = pan (handled at top of Update).
+			if ctrl && !shift {
+				a.maybeCtrlPan = true
+				a.ctrlPanStartMX, a.ctrlPanStartMY = mx, my
+				a.ctrlClickWX, a.ctrlClickWY = wx, wy
+				return nil
+			}
+
 			// Double-click on table text → in-place edit.
 			hit := a.hitTestTable(wx, wy)
 			if a.isDoubleClick(hit) {
@@ -617,7 +1013,23 @@ func (a *App) Update() error {
 					}
 					a.lastClickedGroupID = gid
 					a.lastClickedGroupFrame = a.frameCount
-					a.selectGroupMembers(gid)
+					if additive {
+						// Additive: union the group's members with the existing
+						// table selection.
+						for _, g := range a.currentView().Groups {
+							if g.ID == gid {
+								if a.selectedTables == nil {
+									a.selectedTables = map[string]bool{}
+								}
+								for _, m := range g.Tables {
+									a.selectedTables[m] = true
+								}
+								break
+							}
+						}
+					} else {
+						a.selectGroupMembers(gid)
+					}
 					// Set up for group drag from this position so the user can
 					// drag the whole group by holding the label.
 					a.dragging = true
@@ -633,7 +1045,16 @@ func (a *App) Update() error {
 					a.selectOnlyAnno(id)
 					a.startAnnotationDrag(id, mode, wx, wy)
 				} else {
-					if !a.isAnnoSelected(id) {
+					switch {
+					case additive && a.isAnnoSelected(id):
+						delete(a.selectedAnnos, id)
+						return nil
+					case additive:
+						if a.selectedAnnos == nil {
+							a.selectedAnnos = map[string]bool{}
+						}
+						a.selectedAnnos[id] = true
+					case !a.isAnnoSelected(id):
 						a.selectOnlyAnno(id)
 					}
 					a.draggingAnno = id
@@ -642,7 +1063,17 @@ func (a *App) Update() error {
 					a.captureGroupDragStart()
 				}
 			} else if name := a.tableAtWorld(wx, wy); name != "" {
-				if !a.isTableSelected(name) {
+				switch {
+				case additive && a.isTableSelected(name):
+					// Toggle off — and don't enter drag mode for this click.
+					delete(a.selectedTables, name)
+					return nil
+				case additive:
+					if a.selectedTables == nil {
+						a.selectedTables = map[string]bool{}
+					}
+					a.selectedTables[name] = true
+				case !a.isTableSelected(name):
 					a.selectOnlyTable(name)
 				}
 				a.dragging = true
@@ -651,7 +1082,7 @@ func (a *App) Update() error {
 				a.captureGroupDragStart()
 			} else {
 				// Left-down on empty canvas — defer the decision to either
-				// "selection box" (if drag) or "no-op" (if just a click).
+				// "selection box" (if drag) or "deselect" (if just a click).
 				a.maybeSelecting = true
 				a.selectStartWX, a.selectStartWY = wx, wy
 				a.selectStartMX, a.selectStartMY = mx, my
@@ -660,9 +1091,7 @@ func (a *App) Update() error {
 		}
 	} else {
 		if (a.dragging || a.draggingAnno != "") && a.dirty {
-			if err := a.persist(); err != nil {
-				log.Printf("persist: %v", err)
-			}
+			a.commit()
 		}
 		if a.selecting {
 			a.applyBoxSelection()
@@ -672,12 +1101,18 @@ func (a *App) Update() error {
 			a.selectedTables = nil
 			a.selectedAnnos = nil
 		}
+		// Ctrl-click without drag → toggle-select what was under the cursor.
+		if a.maybeCtrlPan {
+			a.toggleSelectAt(a.ctrlClickWX, a.ctrlClickWY)
+		}
 		a.dragging = false
 		a.draggedTable = ""
 		a.draggingAnno = ""
 		a.dragStartTablePositions = nil
 		a.dragStartAnnoPositions = nil
 		a.maybeSelecting = false
+		a.maybeCtrlPan = false
+		a.ctrlPanning = false
 	}
 
 	_, scrollY := ebiten.Wheel()
@@ -686,20 +1121,18 @@ func (a *App) Update() error {
 		a.camera.ZoomAt(float64(mx), float64(my), factor)
 	}
 
-	if inpututil.IsKeyJustPressed(ebiten.KeyF) {
-		a.fitToTables()
-	}
+	a.handleKeyboardShortcuts()
 
 	if a.menu == nil && a.palette == nil && my >= tabBarHeight {
 		a.hoveredTable = a.tableAtWorld(wx, wy)
 		if a.hoveredTable == "" {
-			a.hoveredGroup = a.groupLabelAtWorld(wx, wy)
+			a.setHoveredGroup(a.groupLabelAtWorld(wx, wy))
 		} else {
-			a.hoveredGroup = ""
+			a.setHoveredGroup("")
 		}
 	} else {
 		a.hoveredTable = ""
-		a.hoveredGroup = ""
+		a.setHoveredGroup("")
 	}
 
 	return nil
@@ -710,10 +1143,7 @@ func (a *App) Update() error {
 func (a *App) fitToTables() {
 	view := a.currentView()
 
-	tableIdx := make(map[string]*dbml.Table, len(a.schema.Tables))
-	for i := range a.schema.Tables {
-		tableIdx[a.schema.Tables[i].Name] = &a.schema.Tables[i]
-	}
+	tableIdx := a.tableIdx
 
 	minX, minY := math.Inf(1), math.Inf(1)
 	maxX, maxY := math.Inf(-1), math.Inf(-1)
@@ -726,7 +1156,7 @@ func (a *App) fitToTables() {
 		if !ok {
 			continue
 		}
-		box := render.MeasureTable(t)
+		box := a.tableSize(t.Name)
 		if p.X < minX {
 			minX = p.X
 		}
@@ -797,9 +1227,7 @@ func (a *App) drainWatcher() {
 				if !report.Empty() {
 					log.Printf("schema drift: +%d orphaned=%d restored=%d",
 						len(report.AddedTables), len(report.OrphanedTables), len(report.RestoredTables))
-					if err := a.persist(); err != nil {
-						log.Printf("persist: %v", err)
-					}
+					a.commit()
 				}
 			case watch.EventMeta:
 				if !a.dirty {
@@ -828,7 +1256,7 @@ func (a *App) tableAtWorld(wx, wy float64) string {
 		if !ok || (p.Hidden) {
 			continue
 		}
-		box := render.MeasureTable(t)
+		box := a.tableSize(t.Name)
 		if wx >= p.X && wx <= p.X+box.W && wy >= p.Y && wy <= p.Y+box.H {
 			return t.Name
 		}
@@ -846,7 +1274,7 @@ func (a *App) hitTestTable(wx, wy float64) tableHit {
 		if !ok || p.Hidden {
 			continue
 		}
-		box := render.MeasureTable(t)
+		box := a.tableSize(t.Name)
 		if wx < p.X || wx > p.X+box.W || wy < p.Y || wy > p.Y+box.H {
 			continue
 		}
@@ -875,6 +1303,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 	a.drawGroups(screen)
 	a.drawRelationships(screen)
 	a.drawTables(screen)
+	a.drawActiveRelationships(screen)
 	a.drawAnnotations(screen)
 	a.drawCellEditOverlay(screen)
 	a.drawGroupRenameOverlay(screen)
@@ -909,7 +1338,7 @@ func (a *App) drawCellEditOverlay(screen *ebiten.Image) {
 		return
 	}
 
-	box := render.MeasureTable(t)
+	box := a.tableSize(t.Name)
 	scale := a.camera.Zoom
 
 	display := e.Buffer
@@ -991,6 +1420,8 @@ type tabKind int
 const (
 	tabKindView tabKind = iota
 	tabKindPlus
+	tabKindUndo
+	tabKindRedo
 	tabKindRearrange
 )
 
@@ -1000,10 +1431,14 @@ type tabRect struct {
 	kind tabKind
 }
 
-const rearrangeLabel = "Rearrange"
+const (
+	rearrangeLabel = "Rearrange"
+	undoLabel      = "Undo"
+	redoLabel      = "Redo"
+)
 
 func (a *App) tabRects(screenW int) []tabRect {
-	rects := make([]tabRect, 0, len(a.doc.Views)+2)
+	rects := make([]tabRect, 0, len(a.doc.Views)+4)
 	x := 8.0
 	for _, v := range a.doc.Views {
 		label := v.Name
@@ -1022,9 +1457,19 @@ func (a *App) tabRects(screenW int) []tabRect {
 	}
 	rects = append(rects, tabRect{x: x, w: tabPlusW, kind: tabKindPlus})
 
+	// Right-anchored buttons: rearrange, then redo, then undo (rendered
+	// right-to-left so undo sits closest to the rearrange action).
 	rearrangeW := render.TextWidth(rearrangeLabel) + 2*tabPadX
-	rearrangeX := float64(screenW) - 8 - rearrangeW
-	rects = append(rects, tabRect{x: rearrangeX, w: rearrangeW, kind: tabKindRearrange})
+	rx := float64(screenW) - 8 - rearrangeW
+	rects = append(rects, tabRect{x: rx, w: rearrangeW, kind: tabKindRearrange})
+
+	redoW := render.TextWidth(redoLabel) + 2*tabPadX
+	rx -= tabGap + redoW
+	rects = append(rects, tabRect{x: rx, w: redoW, kind: tabKindRedo})
+
+	undoW := render.TextWidth(undoLabel) + 2*tabPadX
+	rx -= tabGap + undoW
+	rects = append(rects, tabRect{x: rx, w: undoW, kind: tabKindUndo})
 
 	return rects
 }
@@ -1055,6 +1500,18 @@ func (a *App) drawTabBar(screen *ebiten.Image) {
 			cy := 4 + (tabBarHeight-4)/2
 			vector.StrokeLine(screen, float32(cx-5), float32(cy), float32(cx+5), float32(cy), 1.5, theme.ColorTextMuted, true)
 			vector.StrokeLine(screen, float32(cx), float32(cy-5), float32(cx), float32(cy+5), 1.5, theme.ColorTextMuted, true)
+		case tabKindUndo, tabKindRedo:
+			label := undoLabel
+			enabled := a.history.canUndo()
+			if r.kind == tabKindRedo {
+				label = redoLabel
+				enabled = a.history.canRedo()
+			}
+			c := theme.ColorTextMuted
+			if !enabled {
+				c.A = 0x55
+			}
+			render.DrawText(screen, label, r.x+tabPadX, 4+(tabBarHeight-4-13)/2, 1.0, c)
 		case tabKindRearrange:
 			render.DrawText(screen, rearrangeLabel, r.x+tabPadX, 4+(tabBarHeight-4-13)/2, 1.0, labelColor)
 		case tabKindView:
@@ -1094,6 +1551,14 @@ func (a *App) handleTabBar(mx, my int) bool {
 			if leftJust {
 				a.newView()
 			}
+		case tabKindUndo:
+			if leftJust {
+				a.Undo()
+			}
+		case tabKindRedo:
+			if leftJust {
+				a.Redo()
+			}
 		case tabKindRearrange:
 			if leftJust {
 				a.rearrangeCurrentView()
@@ -1126,10 +1591,7 @@ func (a *App) rearrangeCurrentView() {
 			view.Tables[name] = &meta.TablePlacement{X: p.X, Y: p.Y}
 		}
 	}
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 	a.fitToTables()
 }
 
@@ -1203,11 +1665,15 @@ func (a *App) commitCellEdit() {
 		log.Printf("edit %s.%s (%v): %v", e.Table, e.Column, e.Kind, err)
 		return
 	}
-	if res != nil && res.Schema != nil {
-		a.schema = res.Schema
+	if res == nil || res.Schema == nil {
+		return
+	}
+	a.setSchema(res.Schema)
+	if res.NewBytes != nil {
+		a.dbmlBytes = append([]byte(nil), res.NewBytes...)
 	}
 	// If the active selected/dragged table got renamed, follow the rename so
-	// hover state stays meaningful.
+	// hover/selection state stays meaningful.
 	if e.Kind == cellEditTableName {
 		if a.isTableSelected(e.Table) {
 			delete(a.selectedTables, e.Table)
@@ -1222,22 +1688,17 @@ func (a *App) commitCellEdit() {
 		if a.draggedTable == e.Table {
 			a.draggedTable = e.Buffer
 		}
-		// Carry the position over in metadata: the rename creates a new
-		// schema name; the placement under the old name will be soft-orphaned
-		// on the next reconcile, and a new placement will be made by drift.
-		// To avoid losing the position, copy it explicitly here.
+		// Carry the metadata placement to the new name in one go, so
+		// undo/redo treats the rename as a single atomic step.
 		view := a.currentView()
 		if oldP, ok := view.Tables[e.Table]; ok {
 			view.Tables[e.Buffer] = &meta.TablePlacement{
 				X: oldP.X, Y: oldP.Y, Hidden: oldP.Hidden, Color: oldP.Color,
 			}
 			delete(view.Tables, e.Table)
-			a.dirty = true
-			if err := a.persist(); err != nil {
-				log.Printf("persist: %v", err)
-			}
 		}
 	}
+	a.commit()
 }
 
 func (a *App) cancelCellEdit() {
@@ -1271,14 +1732,11 @@ func (a *App) updateCellEditing() {
 // tableSizeOf reports a table's rendered world-space size. Used by the layout
 // engine for size-aware repulsion so tall tables don't overlap shorter ones.
 func (a *App) tableSizeOf(name string) (float64, float64) {
-	for i := range a.schema.Tables {
-		t := &a.schema.Tables[i]
-		if t.Name == name {
-			box := render.MeasureTable(t)
-			return box.W, box.H
-		}
+	if _, ok := a.tableIdx[name]; !ok {
+		return 0, 0
 	}
-	return 0, 0
+	box := a.tableSize(name)
+	return box.W, box.H
 }
 
 func (a *App) buildViewMenu(viewID string, mx, my int) *widgets.Menu {
@@ -1315,10 +1773,7 @@ func (a *App) newView() {
 	}
 	a.doc.Views = append(a.doc.Views, v)
 	a.activeViewID = v.ID
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 }
 
 func (a *App) deleteView(viewID string) {
@@ -1335,10 +1790,7 @@ func (a *App) deleteView(viewID string) {
 	if a.activeViewID == viewID {
 		a.activeViewID = a.doc.DefaultView().ID
 	}
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 }
 
 func nextViewName(existing []*meta.View) string {
@@ -1374,10 +1826,7 @@ func (a *App) commitRenamingView() {
 				name = v.Name
 			}
 			v.Name = name
-			a.dirty = true
-			if err := a.persist(); err != nil {
-				log.Printf("persist: %v", err)
-			}
+			a.commit()
 			break
 		}
 	}
@@ -1392,10 +1841,7 @@ func (a *App) cancelRenamingView() {
 
 func (a *App) groupLabelAtWorld(wx, wy float64) string {
 	view := a.currentView()
-	tableIdx := make(map[string]*dbml.Table, len(a.schema.Tables))
-	for i := range a.schema.Tables {
-		tableIdx[a.schema.Tables[i].Name] = &a.schema.Tables[i]
-	}
+	tableIdx := a.tableIdx
 	for _, g := range view.Groups {
 		minX, minY := math.Inf(1), math.Inf(1)
 		maxX, maxY := math.Inf(-1), math.Inf(-1)
@@ -1409,7 +1855,7 @@ func (a *App) groupLabelAtWorld(wx, wy float64) string {
 			if !ok {
 				continue
 			}
-			box := render.MeasureTable(t)
+			box := a.tableSize(t.Name)
 			if p.X < minX {
 				minX = p.X
 			}
@@ -1461,10 +1907,7 @@ func (a *App) commitRenamingGroup() {
 			if a.renameGroupBuffer != "" {
 				g.Name = a.renameGroupBuffer
 			}
-			a.dirty = true
-			if err := a.persist(); err != nil {
-				log.Printf("persist: %v", err)
-			}
+			a.commit()
 			break
 		}
 	}
@@ -1534,10 +1977,7 @@ func (a *App) drawGroupRenameOverlay(screen *ebiten.Image) {
 		return
 	}
 
-	tableIdx := make(map[string]*dbml.Table, len(a.schema.Tables))
-	for i := range a.schema.Tables {
-		tableIdx[a.schema.Tables[i].Name] = &a.schema.Tables[i]
-	}
+	tableIdx := a.tableIdx
 	minX, minY := math.Inf(1), math.Inf(1)
 	any := false
 	for _, name := range g.Tables {
@@ -1549,7 +1989,7 @@ func (a *App) drawGroupRenameOverlay(screen *ebiten.Image) {
 		if !ok {
 			continue
 		}
-		box := render.MeasureTable(t)
+		box := a.tableSize(t.Name)
 		_ = box
 		if p.X < minX {
 			minX = p.X
@@ -1651,10 +2091,7 @@ func (a *App) setTableColor(name, hex string) {
 	view := a.currentView()
 	if p, ok := view.Tables[name]; ok {
 		p.Color = hex
-		a.dirty = true
-		if err := a.persist(); err != nil {
-			log.Printf("persist: %v", err)
-		}
+		a.commit()
 	}
 }
 
@@ -1663,10 +2100,7 @@ func (a *App) setGroupColor(id, hex string) {
 	for _, g := range view.Groups {
 		if g.ID == id {
 			g.Color = hex
-			a.dirty = true
-			if err := a.persist(); err != nil {
-				log.Printf("persist: %v", err)
-			}
+			a.commit()
 			return
 		}
 	}
@@ -1674,10 +2108,7 @@ func (a *App) setGroupColor(id, hex string) {
 
 func (a *App) relationshipAtScreen(mx, my int) string {
 	view := a.currentView()
-	tableIdx := make(map[string]*dbml.Table, len(a.schema.Tables))
-	for i := range a.schema.Tables {
-		tableIdx[a.schema.Tables[i].Name] = &a.schema.Tables[i]
-	}
+	tableIdx := a.tableIdx
 
 	screenBox := func(name string) (routing.Box, bool) {
 		p, ok := view.Tables[name]
@@ -1688,7 +2119,7 @@ func (a *App) relationshipAtScreen(mx, my int) string {
 		if !ok {
 			return routing.Box{}, false
 		}
-		box := render.MeasureTable(t)
+		box := a.tableSize(t.Name)
 		sx, sy := a.camera.WorldToScreen(p.X, p.Y)
 		return routing.Box{X: sx, Y: sy, W: box.W * a.camera.Zoom, H: box.H * a.camera.Zoom}, true
 	}
@@ -1746,10 +2177,7 @@ func (a *App) setRelationshipColor(key, hex string) {
 		view.Relationships[key] = style
 	}
 	style.Color = hex
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 }
 
 func (a *App) setAnnotationColor(id, hex string) {
@@ -1758,10 +2186,7 @@ func (a *App) setAnnotationColor(id, hex string) {
 		return
 	}
 	an.Color = hex
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 }
 
 func (a *App) drawAnnotations(screen *ebiten.Image) {
@@ -1915,6 +2340,20 @@ func (a *App) buildCanvasMenu(mx, my int, wx, wy float64) *widgets.Menu {
 	}
 }
 
+// applyDBMLEditResult absorbs a successful dbmledit.Result into in-memory
+// state: refreshed schema + per-schema caches, refreshed dbml-bytes mirror.
+// Caller is responsible for any subsequent metadata mutations and the final
+// a.commit() that snapshots the combined change.
+func (a *App) applyDBMLEditResult(res *dbmledit.Result) {
+	if res == nil || res.Schema == nil {
+		return
+	}
+	a.setSchema(res.Schema)
+	if res.NewBytes != nil {
+		a.dbmlBytes = append([]byte(nil), res.NewBytes...)
+	}
+}
+
 func (a *App) addTable(wx, wy float64) {
 	name := nextNewTableName(a.schema)
 	res, err := dbmledit.AddTable(a.dbmlPath, name)
@@ -1922,27 +2361,16 @@ func (a *App) addTable(wx, wy float64) {
 		log.Printf("add table: %v", err)
 		return
 	}
-	if res != nil && res.Schema != nil {
-		a.schema = res.Schema
-	}
+	a.applyDBMLEditResult(res)
 	view := a.currentView()
 	view.Tables[name] = &meta.TablePlacement{X: wx, Y: wy}
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 	a.selectOnlyTable(name)
 	a.startCellEdit(cellEditTableName, name, "")
 }
 
 func (a *App) addField(table string) {
-	var t *dbml.Table
-	for i := range a.schema.Tables {
-		if a.schema.Tables[i].Name == table {
-			t = &a.schema.Tables[i]
-			break
-		}
-	}
+	t := a.tableByName(table)
 	if t == nil {
 		return
 	}
@@ -1952,9 +2380,8 @@ func (a *App) addField(table string) {
 		log.Printf("add column to %s: %v", table, err)
 		return
 	}
-	if res != nil && res.Schema != nil {
-		a.schema = res.Schema
-	}
+	a.applyDBMLEditResult(res)
+	a.commit()
 	a.startCellEdit(cellEditColumnName, table, name)
 }
 
@@ -1964,9 +2391,8 @@ func (a *App) removeField(table, column string) {
 		log.Printf("remove %s.%s: %v", table, column, err)
 		return
 	}
-	if res != nil && res.Schema != nil {
-		a.schema = res.Schema
-	}
+	a.applyDBMLEditResult(res)
+	a.commit()
 }
 
 func (a *App) removeTable(table string) {
@@ -1975,9 +2401,7 @@ func (a *App) removeTable(table string) {
 		log.Printf("remove table %s: %v", table, err)
 		return
 	}
-	if res != nil && res.Schema != nil {
-		a.schema = res.Schema
-	}
+	a.applyDBMLEditResult(res)
 	delete(a.selectedTables, table)
 	if a.hoveredTable == table {
 		a.hoveredTable = ""
@@ -1985,6 +2409,7 @@ func (a *App) removeTable(table string) {
 	if a.draggedTable == table {
 		a.draggedTable = ""
 	}
+	a.commit()
 }
 
 func nextNewTableName(s *dbml.Schema) string {
@@ -2074,10 +2499,7 @@ func (a *App) newAnnotation(wx, wy float64) {
 		Text: "",
 	}
 	view.Annotations = append(view.Annotations, an)
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 	a.startEditing(an.ID)
 }
 
@@ -2094,10 +2516,7 @@ func (a *App) deleteAnnotation(id string) {
 	if a.editingAnno == id {
 		a.editingAnno = ""
 	}
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 }
 
 func (a *App) startEditing(id string) {
@@ -2115,10 +2534,7 @@ func (a *App) commitEditing() {
 	an := a.findAnnotation(a.editingAnno)
 	if an != nil {
 		an.Text = a.editBuffer
-		a.dirty = true
-		if err := a.persist(); err != nil {
-			log.Printf("persist: %v", err)
-		}
+		a.commit()
 	}
 	a.editingAnno = ""
 	a.editBuffer = ""
@@ -2341,10 +2757,7 @@ func (a *App) newGroupWith(table string) {
 		Name:   nextGroupName(view.Groups),
 		Tables: []string{table},
 	})
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 }
 
 func (a *App) addToGroup(table, groupID string) {
@@ -2359,10 +2772,7 @@ func (a *App) addToGroup(table, groupID string) {
 			}
 		}
 		g.Tables = append(g.Tables, table)
-		a.dirty = true
-		if err := a.persist(); err != nil {
-			log.Printf("persist: %v", err)
-		}
+		a.commit()
 		return
 	}
 }
@@ -2380,10 +2790,7 @@ func (a *App) removeFromGroup(table, groupID string) {
 			}
 		}
 		g.Tables = out
-		a.dirty = true
-		if err := a.persist(); err != nil {
-			log.Printf("persist: %v", err)
-		}
+		a.commit()
 		return
 	}
 }
@@ -2397,10 +2804,7 @@ func (a *App) deleteGroup(groupID string) {
 		}
 	}
 	view.Groups = out
-	a.dirty = true
-	if err := a.persist(); err != nil {
-		log.Printf("persist: %v", err)
-	}
+	a.commit()
 }
 
 func nextGroupName(existing []*meta.Group) string {
@@ -2418,10 +2822,7 @@ func nextGroupName(existing []*meta.Group) string {
 
 func (a *App) drawGroups(screen *ebiten.Image) {
 	view := a.currentView()
-	tableIdx := make(map[string]*dbml.Table, len(a.schema.Tables))
-	for i := range a.schema.Tables {
-		tableIdx[a.schema.Tables[i].Name] = &a.schema.Tables[i]
-	}
+	tableIdx := a.tableIdx
 	for i, g := range view.Groups {
 		minX, minY := math.Inf(1), math.Inf(1)
 		maxX, maxY := math.Inf(-1), math.Inf(-1)
@@ -2435,7 +2836,7 @@ func (a *App) drawGroups(screen *ebiten.Image) {
 			if !ok {
 				continue
 			}
-			box := render.MeasureTable(t)
+			box := a.tableSize(t.Name)
 			if p.X < minX {
 				minX = p.X
 			}
@@ -2584,12 +2985,17 @@ func (a *App) relationshipShouldPulse(r dbml.Relationship) bool {
 	return false
 }
 
-func (a *App) drawRelationships(screen *ebiten.Image) {
+func (a *App) drawRelationships(screen *ebiten.Image) { a.drawRelationshipsFiltered(screen, false) }
+
+// drawActiveRelationships draws only the relationships that are currently
+// "active" (hovered or selected). Called *after* drawTables in the Draw order
+// so the highlighted lines + their pulses + cardinality markers float on top
+// of every table card and aren't obscured by them.
+func (a *App) drawActiveRelationships(screen *ebiten.Image) { a.drawRelationshipsFiltered(screen, true) }
+
+func (a *App) drawRelationshipsFiltered(screen *ebiten.Image, activeOnly bool) {
 	view := a.currentView()
-	tableIdx := make(map[string]*dbml.Table, len(a.schema.Tables))
-	for i := range a.schema.Tables {
-		tableIdx[a.schema.Tables[i].Name] = &a.schema.Tables[i]
-	}
+	tableIdx := a.tableIdx
 
 	screenBox := func(name string) (render.TableBox, bool) {
 		p, ok := view.Tables[name]
@@ -2600,7 +3006,7 @@ func (a *App) drawRelationships(screen *ebiten.Image) {
 		if !ok {
 			return render.TableBox{}, false
 		}
-		box := render.MeasureTable(t)
+		box := a.tableSize(t.Name)
 		sx, sy := a.camera.WorldToScreen(p.X, p.Y)
 		return render.TableBox{
 			X: sx, Y: sy,
@@ -2611,6 +3017,10 @@ func (a *App) drawRelationships(screen *ebiten.Image) {
 
 	for _, r := range a.schema.Relationships {
 		if r.FromTable == r.ToTable {
+			continue
+		}
+		pulse := a.relationshipShouldPulse(r)
+		if pulse != activeOnly {
 			continue
 		}
 		from, ok1 := screenBox(r.FromTable)
@@ -2627,7 +3037,6 @@ func (a *App) drawRelationships(screen *ebiten.Image) {
 				clr = c
 			}
 		}
-		pulse := a.relationshipShouldPulse(r)
 		fromCard, toCard := cardinalityKinds(r.Kind)
 		render.DrawRelationship(screen, from, to, fromCard, toCard, a.camera.Zoom, a.frameCount, clr, a.width, a.height, pulse)
 	}

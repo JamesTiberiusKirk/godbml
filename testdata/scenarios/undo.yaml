@@ -1,0 +1,27 @@
+# Verify undo/redo works across both DBML and metadata mutations.
+# Run: go run ./cmd/godbml-test testdata/scenarios/undo.yaml
+
+schema: testdata/example.dbml
+window: { width: 1280, height: 800 }
+out_dir: testdata/scenarios/shots-undo
+
+steps:
+  - camera: { fit: true }
+  - shoot: 00-baseline.png
+
+  # DBML mutation: rename a column
+  - rename_column: { table: users, column: username, new: handle }
+  - shoot: 01-after-rename.png
+
+  # Metadata mutation: change colour
+  - select_tables: [users]
+  - shoot: 02-selected.png
+
+  # Undo the rename — column should be `username` again
+  - clear_selection: true
+  - undo: true
+  - shoot: 03-after-undo.png
+
+  # Redo — back to `handle`
+  - redo: true
+  - shoot: 04-after-redo.png
